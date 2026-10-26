@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Profiler traces are large; keep them local
+results/traces/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
