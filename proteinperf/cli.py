@@ -10,6 +10,7 @@ from proteinperf.benchmark import benchmark_inference
 from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
+from proteinperf.report import load_results, markdown_table, plot_results
 from proteinperf.sequences import synthetic_sequences
 
 RESULTS_DIR = Path("results")
@@ -90,6 +91,16 @@ def cmd_profile(args):
         print(f"  {op['op']:45} {op['category']:12} {op['device_ms']:8.2f} ms  {op['calls']:>5} calls")
     print(f"\nTrace saved to {trace_path} (open it at https://ui.perfetto.dev)")
 
+def cmd_report(args):
+    data = load_results(args.input)
+    rows = data["results"]
+    gpu = data.get("metadata", {}).get("environment", {}).get("gpu")
+    
+    for path in plot_results(rows, args.output_dir, batch_size=args.batch_size, title_suffix=gpu):
+        print(f"Saved {path}")
+    print(f"\nBatch {args.batch_size}, length {args.seq_len}:\n")
+    print(markdown_table(rows, args.batch_size, args.seq_len))
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="proteinperf", description="Benchmark and profile ESM-2 protein language models")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -116,6 +127,13 @@ def main(argv=None):
     prof.add_argument("--seed", type=int, default=0)
     prof.set_defaults(func=cmd_profile)
 
+    rep = commands.add_parser("report", help="Charts and a summary table from benchmark results")
+    rep.add_argument("--input", default=str(RESULTS_DIR / "baseline.json"))
+    rep.add_argument("--output-dir", default=str(RESULTS_DIR / "charts"))
+    rep.add_argument("--batch-size", type=int, default=8)
+    rep.add_argument("--seq-len", type=int, default=512)
+    rep.set_defaults(func=cmd_report)
+    
     args = parser.parse_args(argv)
     if getattr(args, "seq_len", 0) > MAX_SEQUENCE_LENGTH or any(l > MAX_SEQUENCE_LENGTH for l in getattr(args, "seq_lens", [])):
         parser.error(f"ESM-2 supports sequences up to {MAX_SEQUENCE_LENGTH} residues")
