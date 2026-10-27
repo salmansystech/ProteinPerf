@@ -134,3 +134,92 @@ def plot_results(rows: List[dict], output_dir: str, batch_size: int = 8, title_s
     plt.close(fig)
     saved.append(str(path))
     return saved
+
+VARIANT_COLORS = {
+    "compile": "#2563eb",
+    "compile-cudagraphs": "#7c3aed",
+    "sdpa-efficient": "#16a34a",
+    "sdpa-cudnn": "#ea580c",
+    "sdpa-flash": "#0891b2",
+    "sdpa-math": "#64748b",
+}
+
+# sdpa-efficient runs exactly the same kernels as eager mode, so its speed-up should be 1.0.
+# Any deviation is measurement noise (for example GPU clock changes on a laptop).
+NOISE_CONTROL = "sdpa-efficient"
+NOISE_TOLERANCE = 0.1
+
+def noisy_shapes(rows: List[dict]) -> set:
+    """(model, batch, length) whose control variant deviates from 1.0 by more than the tolerance"""
+    return {(r["model"], r["batch_size"], r["seq_len"]) for r in rows
+            if r["variant"] == NOISE_CONTROL and r.get("speedup_vs_eager")
+            and abs(r["speedup_vs_eager"] - 1) > NOISE_TOLERANCE}
+
+def optimization_table(rows: List[dict], model: str) -> str:
+    """Speed-up of each variant over eager mode for one model, one row per batch size × length.
+
+    Shapes where the noise control deviates from 1.0 are marked with a warning sign.
+    """
+    noisy = noisy_shapes(rows)
+    rows = [r for r in rows if r["model"] == model]
+    variants = [v for v in VARIANT_COLORS if any(r["variant"] == v for r in rows)]
+    shapes = sorted({(r["batch_size"], r["seq_len"]) for r in rows})
+    index = {(r["batch_size"], r["seq_len"], r["variant"]): r for r in rows}
+
+    lines = ["| Batch × length | Eager | " + " | ".join(f"`{v}`" for v in variants) + " |",
+             "|" + "---|" * (2 + len(variants))]
+    for batch, length in shapes:
+        eager = index.get((batch, length, "eager"))
+        cells = [f"{eager['latency_ms']:.1f} ms" if eager else "-"]
+        for variant in variants:
+            row = index.get((batch, length, variant))
+            cells.append(f"{row['speedup_vs_eager']:.2f}×" if row and row.get("speedup_vs_eager") else "n/a")
+        marker = " ⚠" if (model, batch, length) in noisy else ""
+        lines.append(f"| {batch} × {length}{marker} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+def batching_table(rows: List[dict]) -> str:
+    """Time, throughput and padding efficiency per batching strategy"""
+    lines = ["| Strategy | Batches | Total time | Proteins/s | Padding efficiency | Speed-up |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| `{r['strategy']}` | {r['batches']} | {r['total_s']:.1f} s | {r['sequences_per_s']:.1f} | "
+                     f"{r['padding_efficiency']:.0%} | {r['speedup_vs_unsorted']:.2f}× |")
+    return "\n".join(lines)
+
+def plot_optimizations(rows: List[dict], output_dir: str, title_suffix: Optional[str] = None) -> str:
+    """Speed-up of each variant over eager, one panel per model; returns the saved path"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    models = [m for m in MODEL_ORDER if any(r["model"] == m for r in rows)]
+    variants = [v for v in VARIANT_COLORS if any(r["variant"] == v for r in rows)]
+    noisy = noisy_shapes(rows)
+    fig, axes = plt.subplots(1, len(models), figsize=(6.5 * len(models), 4.4), squeeze=False)
+
+    for ax, model in zip(axes[0], models):
+        model_rows = [r for r in rows if r["model"] == model]
+        shapes = sorted({(r["batch_size"], r["seq_len"]) for r in model_rows})
+        index = {(r["batch_size"], r["seq_len"], r["variant"]): r for r in model_rows}
+        width = 0.8 / len(variants)
+        for i, variant in enumerate(variants):
+            values = [(index.get((b, l, variant)) or {}).get("speedup_vs_eager") or 0 for b, l in shapes]
+            ax.bar([x + i * width for x in range(len(shapes))], values, width, color=VARIANT_COLORS[variant], label=variant)
+        ax.axhline(1, color="#0f172a", linestyle="--", linewidth=1)
+        labels = [f"{b} × {l}" + ("\n(noisy)" if (model, b, l) in noisy else "") for b, l in shapes]
+        ax.set_xticks([x + width * (len(variants) - 1) / 2 for x in range(len(shapes))], labels)
+        ax.set_xlabel("Batch size × sequence length")
+        ax.set_title(f"ESM-2 {model}")
+        ax.grid(axis="y", alpha=0.3)
+    axes[0][0].set_ylabel("Speed-up over eager")
+    axes[0][-1].legend(fontsize=8)
+    suffix = f"\n{title_suffix}" if title_suffix else ""
+    fig.suptitle(f"Framework-level optimizations, FP16 (above the dashed line is faster){suffix}", fontsize=11)
+    fig.tight_layout()
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "optimizations.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return str(path)
