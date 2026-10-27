@@ -14,7 +14,8 @@ This document explains how ProteinPerf is built and, just as importantly, how it
 8. [Testing strategy](#8-testing-strategy)
 9. [Design decisions](#9-design-decisions)
 10. [Framework-level optimizations (phase 3)](#10-framework-level-optimizations-phase-3)
-11. [Planned architecture](#11-planned-architecture)
+11. [Custom Triton kernels (phase 4)](#11-custom-triton-kernels-phase-4)
+12. [Planned architecture](#12-planned-architecture)
 
 ---
 
@@ -81,6 +82,7 @@ Models are loaded once per model and precision, then reused for every sequence l
 | `environment.py` | Reproducibility metadata | `environment_info()` |
 | `variants.py` | Framework-level optimizations (phase 3) | `build_variant()`, `output_difference()`, `VARIANTS` |
 | `batching.py` | Batching strategies for mixed-length proteins (phase 3) | `make_batches()`, `padding_stats()`, `run_dataset()` |
+| `kernels/` | Custom Triton kernels, model patching and microbenchmarks (phase 4) | `rotary_embedding()`, `gelu()`, `linear()`, `esm_triton_kernels()`, `benchmark_kernels()` |
 | `cli.py` | Argument parsing and orchestration | `main()` and one `cmd_*` function per command |
 
 ```mermaid
@@ -93,6 +95,8 @@ flowchart TD
     cli --> environment[environment.py]
     cli --> variants[variants.py]
     cli --> batching[batching.py]
+    cli --> kernels[kernels/]
+    variants --> kernels
 ```
 
 The measurement modules (`benchmark.py`, `profiling.py`) take any PyTorch model and any callable tokenizer. They don't depend on `models.py`, which is what lets the tests run them with a tiny model, and will let later phases measure compiled models and custom kernels with the same code.
@@ -265,6 +269,8 @@ It also prints a Markdown table of sequences per second and peak memory, ready f
 | `test_report.py` | Speed-up calculation, Markdown table (including OOM cells), chart files |
 | `test_variants.py` | Variant construction, attention backend wrapper, output comparison |
 | `test_batching.py` | Every strategy covers each sequence once, sorting, token budgets, padding statistics, a dataset run |
+| `test_kernels.py` | Each Triton kernel against PyTorch on the GPU (skipped without CUDA) |
+| `test_patch.py` | Kernels are swapped in and always restored, variant construction |
 | `test_cli.py` | Argument validation |
 
 - **No GPU and no downloads:** `conftest.py` builds a 2-layer ESM model with random weights and a minimal tokenizer, so the real benchmark and profiler code runs on CPU in seconds.
@@ -340,7 +346,68 @@ The input is `data/uniprot_human_sample.fasta`: 2,000 reviewed human proteins fr
 
 ---
 
-## 11. Planned architecture
+## 11. Custom Triton kernels (phase 4)
+
+Phase 1 profiling showed that after switching to FP16, elementwise and memory operations take about 40% of GPU time. They're memory-bound: each one reads a whole tensor from GPU memory and writes a whole tensor back, doing very little math. Phase 4 replaces the biggest of them with **fused** Triton kernels that read their inputs once, do all the math in registers, and write once.
+
+```
+proteinperf/kernels/
+├── rotary.py   # fused rotary position embedding for q and k
+├── gelu.py     # fused exact GELU
+├── matmul.py   # tiled matmul with optional fused bias + GELU epilogue
+├── patch.py    # swaps the kernels into Hugging Face's ESM-2 at run time
+└── bench.py    # microbenchmarks against PyTorch eager and torch.compile
+```
+
+### What each kernel replaces
+
+```mermaid
+flowchart LR
+    subgraph Before["Hugging Face ESM-2 (per layer, FP16)"]
+        direction TB
+        A1["q.float(), k.float()"] --> A2["rotate_half: slice, neg, cat (× 2)"]
+        A2 --> A3["x·cos + rot(x)·sin (× 2)"] --> A4[".to(fp16) (× 2)"]
+        B1["addmm (cuBLAS)"] --> B2["÷√2 → erf → +1 → ×x → ×0.5"]
+    end
+    subgraph After["With Triton kernels"]
+        direction TB
+        C1["rotary kernel:<br/>1 launch for q and k"]
+        D1["matmul kernel with<br/>bias + GELU epilogue"]
+    end
+    Before --> After
+```
+
+| Kernel | Replaces | Design |
+|---|---|---|
+| **Rotary** (`rotary.py`) | Per layer: casts of q and k to FP32, `rotate_half` (slice, negate, concatenate), 4 multiplies, 2 adds and 2 casts back | Each program handles 32 (batch, head, position) rows. It loads both halves of q and k plus cos and sin, computes `x1·cos − x2·sin` and `x2·cos + x1·sin` in FP32, and stores the result in the input dtype. It reads strided inputs directly, so the transposed q and k views need no copy. |
+| **GELU** (`gelu.py`) | Divide, `erf`, add, multiply, multiply | One flat elementwise kernel: load, compute `x·0.5·(1 + erf(x/√2))` in FP32, store. |
+| **Matmul** (`matmul.py`) | cuBLAS `addmm` + the 5 GELU kernels in the feed-forward up-projection | Each program computes a `BLOCK_M × BLOCK_N` output tile, looping over `BLOCK_K` slices with `tl.dot` (tensor cores) and accumulating in FP32. Programs are ordered in groups of 8 row-tiles so concurrent programs share input tiles in the L2 cache. The bias and GELU are applied in the **epilogue**, while the result is still in registers, so the large activation is written to memory once instead of being written and read back by separate GELU kernels. `@triton.autotune` picks tile sizes, pipeline stages and warps per shape. |
+
+### Swapping kernels into the model
+
+Hugging Face's `EsmSelfAttention.forward` calls the module-level function `apply_rotary_pos_emb`, and `EsmIntermediate.forward` calls `gelu`. Both are looked up at call time, so `esm_triton_kernels()` (`patch.py`) replaces them inside a context manager and restores the originals afterwards, even if the model raises an error. The model's code and weights are unchanged.
+
+`TritonKernelModel` (`variants.py`) runs a model inside that context, so each combination of kernels is just another variant for the `optimize` command:
+
+| Variant | Kernels |
+|---|---|
+| `triton-rotary` | Rotary |
+| `triton-gelu` | GELU |
+| `triton-ffn` | Matmul with fused bias + GELU (replaces the whole up-projection, including GELU) |
+| `triton` | Rotary + matmul with fused bias + GELU |
+
+### Correctness and measurement
+
+- **Correctness tests** (`tests/test_kernels.py`) compare each kernel with PyTorch on the GPU: the head sizes of every ESM-2 model (16, 24, 32 and 64, including a half size of 12 that isn't a power of two), FP16, BF16 and FP32, non-contiguous inputs, and matrix sizes that aren't multiples of the tile size. They're skipped on machines without a CUDA GPU, such as CI.
+- **The rotary kernel is exact.** Like Hugging Face, it computes in FP32 and rounds once, so its output matches to the last bit up to fused multiply-add rounding.
+- **GELU and the fused matmul differ by FP16 rounding.** They compute GELU in FP32, where Hugging Face computes it step by step in FP16, so the kernels are slightly more accurate.
+- **Microbenchmarks** (`kernels` command, `bench.py`) use `triton.testing.do_bench`, which flushes the L2 cache between runs, and compare each kernel with the eager PyTorch code it replaces and with `torch.compile` of that same code.
+- **Bandwidth** of the memory-bound kernels is reported as a percentage of the bandwidth measured by a large device-to-device copy: the practical ceiling on this GPU.
+- **Whole-model results** use the same `optimize` command as phase 3, with the `sdpa-efficient` noise control.
+
+---
+
+## 12. Planned architecture
 
 Later phases plug into the same measurement pipeline:
 
@@ -356,5 +423,4 @@ flowchart LR
 | Phase | New modules (planned) |
 |---|---|
 | 2. Compute and memory analysis | `roofline.py`: FLOPs and bytes per layer from the model configuration, arithmetic intensity, and roofline charts against the GPU's peak compute and bandwidth |
-| 4. Custom kernels | `kernels/` with Triton kernels (fused LayerNorm and GELU, rotary embeddings, tiled matmul), tested for numerical correctness against PyTorch, then swapped into the model |
 | 5. Profiling assistant | An agent that reads profile reports and explains bottlenecks in plain language |
