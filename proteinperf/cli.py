@@ -13,7 +13,7 @@ from proteinperf.benchmark import benchmark_inference
 from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
-from proteinperf.report import (batching_table, load_results, markdown_table, optimization_table,
+from proteinperf.report import (batching_table, kernel_table, load_results, markdown_table, optimization_table,
                                 plot_optimizations, plot_results, valid_rows)
 from proteinperf.sequences import read_fasta, synthetic_sequences
 from proteinperf.variants import VARIANTS, build_variant, output_difference
@@ -227,6 +227,18 @@ def cmd_report(args):
         print("\nBatching strategies:\n")
         print(batching_table(load_results(args.batching)["results"]))
 
+    if Path(args.kernels).exists():
+        print("\nTriton kernel microbenchmarks:\n")
+        print(kernel_table(load_results(args.kernels)["results"]))
+
+    if Path(args.kernel_variants).exists():
+        kv_rows = valid_rows(load_results(args.kernel_variants)["results"])
+        title = "Custom Triton kernels vs torch.compile, FP16 (above the dashed line is faster)"
+        print(f"\nSaved {plot_optimizations(kv_rows, args.output_dir, title_suffix=gpu, filename='kernels.png', title=title)}")
+        for model in dict.fromkeys(r["model"] for r in kv_rows):
+            print(f"\nESM-2 {model}, whole-model speed-up over eager:\n")
+            print(optimization_table(kv_rows, model))
+
 def cmd_kernels(args):
     from proteinperf.kernels.bench import benchmark_kernels, measured_bandwidth_gbs
 
@@ -313,6 +325,8 @@ def main(argv=None):
     rep.add_argument("--seq-len", type=int, default=512)
     rep.add_argument("--optimizations", default=str(RESULTS_DIR / "optimizations.json"), help="Included when the file exists")
     rep.add_argument("--batching", default=str(RESULTS_DIR / "batching.json"), help="Included when the file exists")
+    rep.add_argument("--kernels", default=str(RESULTS_DIR / "kernels.json"), help="Included when the file exists")
+    rep.add_argument("--kernel-variants", default=str(RESULTS_DIR / "kernel_variants.json"), help="Included when the file exists")
     rep.set_defaults(func=cmd_report)
     
     args = parser.parse_args(argv)

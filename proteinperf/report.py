@@ -142,6 +142,10 @@ VARIANT_COLORS = {
     "sdpa-cudnn": "#ea580c",
     "sdpa-flash": "#0891b2",
     "sdpa-math": "#64748b",
+    "triton-rotary": "#db2777",
+    "triton-gelu": "#f59e0b",
+    "triton-ffn": "#0d9488",
+    "triton": "#dc2626",
 }
 
 # sdpa-efficient runs exactly the same kernels as eager mode, so its speed-up should be 1.0.
@@ -186,7 +190,9 @@ def batching_table(rows: List[dict]) -> str:
                      f"{r['padding_efficiency']:.0%} | {r['speedup_vs_unsorted']:.2f}× |")
     return "\n".join(lines)
 
-def plot_optimizations(rows: List[dict], output_dir: str, title_suffix: Optional[str] = None) -> str:
+def plot_optimizations(rows: List[dict], output_dir: str, title_suffix: Optional[str] = None,
+                       filename: str = "optimizations.png",
+                       title: str = "Framework-level optimizations, FP16 (above the dashed line is faster)") -> str:
     """Speed-up of each variant over eager, one panel per model; returns the saved path"""
     import matplotlib
     matplotlib.use("Agg")
@@ -214,12 +220,33 @@ def plot_optimizations(rows: List[dict], output_dir: str, title_suffix: Optional
     axes[0][0].set_ylabel("Speed-up over eager")
     axes[0][-1].legend(fontsize=8)
     suffix = f"\n{title_suffix}" if title_suffix else ""
-    fig.suptitle(f"Framework-level optimizations, FP16 (above the dashed line is faster){suffix}", fontsize=11)
+    fig.suptitle(f"{title}{suffix}", fontsize=11)
     fig.tight_layout()
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / "optimizations.png"
+    path = out / filename
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
+
+KERNEL_NAMES = {
+    "rotary": "Rotary embedding",
+    "gelu": "GELU",
+    "matmul": "Matmul (feed-forward up-projection)",
+    "matmul+gelu": "Matmul + bias + GELU",
+}
+
+def kernel_table(rows: List[dict]) -> str:
+    """Triton kernel times against PyTorch eager and torch.compile, with achieved bandwidth or FLOPS"""
+    lines = ["| Model | Kernel | Eager | torch.compile | Triton | vs eager | vs compile | Throughput | Max diff |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        if "triton_gbs" in r:
+            throughput = f"{r['triton_gbs']:.0f} GB/s ({r['bandwidth_utilization']:.0%})" if "bandwidth_utilization" in r else f"{r['triton_gbs']:.0f} GB/s"
+        else:
+            throughput = f"{r['triton_tflops']:.1f} TFLOPS"
+        lines.append(f"| {r['model']} | {KERNEL_NAMES.get(r['kernel'], r['kernel'])} | {r['eager_ms']:.3f} ms | "
+                     f"{r['compiled_ms']:.3f} ms | {r['triton_ms']:.3f} ms | {r['speedup_vs_eager']:.2f}× | "
+                     f"{r['speedup_vs_compile']:.2f}× | {throughput} | {r['max_abs_diff']:.4f} |")
+    return "\n".join(lines)
