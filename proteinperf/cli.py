@@ -13,7 +13,8 @@ from proteinperf.benchmark import benchmark_inference
 from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
-from proteinperf.report import load_results, markdown_table, plot_results, valid_rows
+from proteinperf.report import (batching_table, load_results, markdown_table, optimization_table,
+                                plot_optimizations, plot_results, valid_rows)
 from proteinperf.sequences import read_fasta, synthetic_sequences
 from proteinperf.variants import VARIANTS, build_variant, output_difference
 
@@ -213,6 +214,17 @@ def cmd_report(args):
     print(f"\nBatch {args.batch_size}, length {args.seq_len}:\n")
     print(markdown_table(rows, args.batch_size, args.seq_len))
 
+    if Path(args.optimizations).exists():
+        opt_rows = valid_rows(load_results(args.optimizations)["results"])
+        print(f"\nSaved {plot_optimizations(opt_rows, args.output_dir, title_suffix=gpu)}")
+        for model in dict.fromkeys(r["model"] for r in opt_rows):
+            print(f"\nESM-2 {model}, speed-up over eager:\n")
+            print(optimization_table(opt_rows, model))
+
+    if Path(args.batching).exists():
+        print("\nBatching strategies:\n")
+        print(batching_table(load_results(args.batching)["results"]))
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="proteinperf", description="Benchmark and profile ESM-2 protein language models")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -266,6 +278,8 @@ def main(argv=None):
     rep.add_argument("--output-dir", default=str(RESULTS_DIR / "charts"))
     rep.add_argument("--batch-size", type=int, default=8)
     rep.add_argument("--seq-len", type=int, default=512)
+    rep.add_argument("--optimizations", default=str(RESULTS_DIR / "optimizations.json"), help="Included when the file exists")
+    rep.add_argument("--batching", default=str(RESULTS_DIR / "batching.json"), help="Included when the file exists")
     rep.set_defaults(func=cmd_report)
     
     args = parser.parse_args(argv)
