@@ -227,6 +227,29 @@ def cmd_report(args):
         print("\nBatching strategies:\n")
         print(batching_table(load_results(args.batching)["results"]))
 
+def cmd_kernels(args):
+    from proteinperf.kernels.bench import benchmark_kernels, measured_bandwidth_gbs
+
+    bandwidth = measured_bandwidth_gbs()
+    print(f"Measured copy bandwidth: {bandwidth:.0f} GB/s", flush=True)
+    rows = []
+    for size in args.models:
+        for row in benchmark_kernels(size, args.batch_size, args.seq_len, DTYPES[args.dtype]):
+            if "triton_gbs" in row:
+                row["bandwidth_utilization"] = row["triton_gbs"] / bandwidth
+            rows.append(row)
+            extra = (f"{row['triton_gbs']:6.0f} GB/s ({row['bandwidth_utilization']:.0%})" if "triton_gbs" in row
+                     else f"{row['triton_tflops']:6.1f} TFLOPS")
+            print(f"  {size:5} {row['kernel']:12} eager {row['eager_ms']:7.3f} ms  compile {row['compiled_ms']:7.3f} ms  "
+                  f"triton {row['triton_ms']:7.3f} ms  {row['speedup_vs_eager']:5.2f}x vs eager  "
+                  f"{row['speedup_vs_compile']:5.2f}x vs compile  {extra}  max diff {row['max_abs_diff']:.4f}", flush=True)
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _save_results(output, rows, _metadata(dtype=args.dtype, batch_size=args.batch_size, seq_len=args.seq_len,
+                                          measured_bandwidth_gbs=bandwidth))
+    print(f"\nSaved results to {output} and {output.with_suffix('.json')}")
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="proteinperf", description="Benchmark and profile ESM-2 protein language models")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -274,6 +297,14 @@ def main(argv=None):
     bat.add_argument("--max-tokens", type=int, default=4096, help="Token budget per batch for the token-budget strategy")
     bat.add_argument("--output", default=str(RESULTS_DIR / "batching.csv"))
     bat.set_defaults(func=cmd_batching)
+
+    ker = commands.add_parser("kernels", help="Microbenchmark the custom Triton kernels against PyTorch and torch.compile")
+    ker.add_argument("--models", type=_str_list, default=["150M", "650M"], help="Model sizes whose layer shapes are used")
+    ker.add_argument("--dtype", default="fp16", choices=list(DTYPES))
+    ker.add_argument("--batch-size", type=int, default=8)
+    ker.add_argument("--seq-len", type=int, default=512)
+    ker.add_argument("--output", default=str(RESULTS_DIR / "kernels.csv"))
+    ker.set_defaults(func=cmd_kernels)
 
     rep = commands.add_parser("report", help="Charts and a summary table from benchmark results")
     rep.add_argument("--input", default=str(RESULTS_DIR / "baseline.json"))
