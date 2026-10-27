@@ -25,13 +25,28 @@ def cmd_info(args):
     for key, value in environment_info().items():
         print(f"{key:20} {value}")
 
+def _save_results(output: Path, rows: list, metadata: dict):
+    """Write results as CSV and as JSON with metadata"""
+    with output.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    output.with_suffix(".json").write_text(json.dumps({"metadata": metadata, "results": rows}, indent=2))
+
 def cmd_benchmark(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = []
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "environment": environment_info(),
+        "settings": {"warmup": args.warmup, "iters": args.iters, "seed": args.seed},
+    }
 
     for size in args.models:
         for dtype in args.dtypes:
-            print(f"\nLoading ESM-2 {size} ({dtype}) on {device}...")
+            print(f"\nLoading ESM-2 {size} ({dtype}) on {device}...", flush=True)
             model, tokenizer = load_model(size, dtype, device)
             for seq_len in args.seq_lens:
                 for batch_size in args.batch_sizes:
@@ -41,34 +56,22 @@ def cmd_benchmark(args):
                                                      warmup=args.warmup, iters=args.iters)
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
-                        print(f"  batch {batch_size:>3} x len {seq_len:>4}: out of GPU memory")
+                        print(f"  batch {batch_size:>3} x len {seq_len:>4}: out of GPU memory", flush=True)
                         continue
                     rows.append(result.to_dict())
+                    # Save after every result so a long run can be stopped without losing data
+                    _save_results(output, rows, metadata)
                     print(f"  batch {batch_size:>3} x len {seq_len:>4}: {result.latency_ms:8.2f} ms  "
                           f"{result.sequences_per_s:8.1f} seq/s  {result.tokens_per_s:10.0f} tok/s  "
-                          f"{result.peak_memory_mb:7.0f} MB")
+                          f"{result.peak_memory_mb:7.0f} MB", flush=True)
             del model
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-    if not rows:
+    if rows:
+        print(f"\nSaved {len(rows)} results to {output} and {output.with_suffix('.json')}")
+    else:
         print("No results to save.")
-        return
-
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-    metadata = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "environment": environment_info(),
-        "settings": {"warmup": args.warmup, "iters": args.iters, "seed": args.seed},
-    }
-    output.with_suffix(".json").write_text(json.dumps({"metadata": metadata, "results": rows}, indent=2))
-    print(f"\nSaved {len(rows)} results to {output} and {output.with_suffix('.json')}")
 
 def cmd_profile(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
