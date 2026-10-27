@@ -58,7 +58,13 @@ python -m proteinperf benchmark --models 8M,35M,150M --dtypes fp32,fp16,bf16 --b
 # Where GPU time goes in one configuration
 python -m proteinperf profile --model 150M --dtype fp16 --batch-size 8 --seq-len 512
 
-# Charts and a summary table from the benchmark results
+# Compare torch.compile, CUDA graphs and attention backends with eager mode
+python -m proteinperf optimize --models 150M --dtype fp16
+
+# Compare batching strategies on 1,000 real proteins
+python -m proteinperf batching --model 150M --dtype fp16
+
+# Charts and summary tables from the results
 python -m proteinperf report --input results/benchmark.json
 ```
 
@@ -73,7 +79,9 @@ Full setup instructions, including WSL2 for the Triton work, are in the [Develop
 | `info` | GPU, compute capability, CUDA, BF16 support and library versions | |
 | `benchmark` | Times every combination of the given settings and saves CSV and JSON results | `--models`, `--dtypes`, `--batch-sizes`, `--seq-lens`, `--warmup`, `--iters`, `--output` |
 | `profile` | GPU time by operator category and the slowest operators, plus a trace file | `--model`, `--dtype`, `--batch-size`, `--seq-len`, `--iters` |
-| `report` | Throughput, speed-up and memory charts, and a Markdown table | `--input`, `--output-dir`, `--batch-size`, `--seq-len` |
+| `optimize` | Compares `torch.compile`, CUDA graphs and attention backends with eager mode, including accuracy | `--models`, `--dtype`, `--variants`, `--batch-sizes`, `--seq-lens` |
+| `batching` | Compares batching strategies on real proteins of different lengths | `--fasta`, `--limit`, `--model`, `--dtype`, `--batch-size`, `--max-tokens` |
+| `report` | Charts and Markdown tables for benchmark, optimization and batching results | `--input`, `--optimizations`, `--batching`, `--output-dir` |
 
 Run `python -m proteinperf <command> --help` for every option.
 
@@ -131,6 +139,65 @@ Measured on an **NVIDIA GeForce RTX 3070 Laptop GPU** (8 GB, Ampere, compute cap
 6. **Longer sequences cost more per token.** ESM-2 650M in FP16 drops from 10,800 tokens/s at length 128 to about 7,500 at lengths 512–1000, as attention cost grows with the square of the length.
 
 **About the hardware:** under sustained load, this laptop's GPU ran at about 800–1,700 MHz, below its 2,100 MHz maximum, because of the laptop's power and cooling limits. The numbers reflect this real-world laptop, not a desktop RTX 3070.
+
+### Framework-level optimizations (phase 3)
+
+Each optimization was measured against eager mode **in the same run**, for ESM-2 150M and 650M in FP16, at batch sizes 1, 8 and 32 and lengths 256 and 512. Raw data: [`results/optimizations.csv`](results/optimizations.csv).
+
+| Variant | What it does |
+|---|---|
+| `compile` | `torch.compile` (Inductor) fuses operators into generated Triton kernels |
+| `compile-cudagraphs` | `torch.compile(mode="reduce-overhead")`: also replays the kernels as one CUDA graph |
+| `sdpa-efficient` | Forces the memory-efficient attention kernel: **the same kernel eager mode already uses**, so it serves as a noise control |
+| `sdpa-cudnn` | Forces cuDNN's attention kernel |
+| `sdpa-math` | Forces unfused attention (separate matmul, softmax and matmul) |
+
+**Speed-up over eager mode** (⚠ marks shapes where the noise control deviated from 1.00× by more than 10%, so small differences there aren't meaningful):
+
+**ESM-2 150M**
+
+| Batch × length | Eager | `compile` | `compile-cudagraphs` | `sdpa-efficient` | `sdpa-cudnn` | `sdpa-math` |
+|---|---|---|---|---|---|---|
+| 1 × 256 | 27.5 ms | 1.88× | 2.56× | 0.98× | 0.77× | 0.60× |
+| 1 × 512 ⚠ | 55.1 ms | 3.41× | 3.57× | 1.47× | 1.70× | 1.19× |
+| 8 × 256 | 65.3 ms | 1.61× | 1.63× | 0.99× | 0.99× | 0.53× |
+| 8 × 512 ⚠ | 132.9 ms | 1.51× | 1.53× | 0.71× | 1.02× | 0.32× |
+| 32 × 256 | 304.2 ms | 2.07× | 2.10× | 0.95× | 1.23× | 0.50× |
+| 32 × 512 | 720.0 ms | 1.32× | 1.63× | 1.00× | 0.96× | 0.45× |
+
+**ESM-2 650M**
+
+| Batch × length | Eager | `compile` | `compile-cudagraphs` | `sdpa-efficient` | `sdpa-cudnn` | `sdpa-math` |
+|---|---|---|---|---|---|---|
+| 1 × 256 ⚠ | 30.1 ms | 1.26× | 1.29× | 0.81× | 0.99× | 0.74× |
+| 1 × 512 ⚠ | 89.0 ms | 2.30× | 2.24× | 1.28× | 1.75× | 1.10× |
+| 8 × 256 | 267.1 ms | 1.69× | 1.78× | 0.98× | 1.45× | 0.72× |
+| 8 × 512 | 561.4 ms | 1.26× | 1.24× | 1.00× | 0.99× | 0.66× |
+| 32 × 256 | 1043.5 ms | 1.25× | 1.25× | 1.00× | 0.98× | 0.73× |
+| 32 × 512 | 2094.6 ms | 1.24× | 1.24× | 1.00× | 0.97× | 0.64× |
+
+![Speed-up of each optimization over eager mode](results/charts/optimizations.png)
+
+**Batching 1,000 real human proteins** (UniProtKB/Swiss-Prot, 16–1,021 residues, median 367; ESM-2 150M FP16, 8 proteins per batch or a 4,096-token budget). Raw data: [`results/batching.csv`](results/batching.csv).
+
+| Strategy | Batches | Total time | Proteins/s | Padding efficiency | Speed-up |
+|---|---|---|---|---|---|
+| `unsorted` | 125 | 36.6 s | 27.3 | 54% | 1.00× |
+| `sorted` | 125 | 19.4 s | 51.4 | 99% | 1.88× |
+| `token-budget` | 109 | 19.4 s | 51.5 | 99% | 1.88× |
+
+### Phase 3 findings
+
+Conclusions use only the shapes where the noise control stayed within 10% of 1.00×.
+
+1. **`torch.compile` speeds up ESM-2 by 1.2–2.1× with no code changes.** The whole model compiled as a single graph, with no graph breaks. The smaller 150M model gains more (1.3–2.1×) than 650M (1.2–1.7×), because in the larger model the matrix multiplies, which compiling doesn't change, take a bigger share of the time. Compilation costs 20–28 seconds on the first call.
+2. **The embeddings stay the same.** Across all variants and shapes, the lowest per-token cosine similarity with eager mode is 0.998 and the largest mean absolute difference is 0.002, at the level of normal FP16 rounding.
+3. **CUDA graphs matter when launch overhead dominates.** For 150M at batch 1 × 256, CUDA graphs raise the speed-up from 1.88× to 2.56×, confirming the phase 1 finding that the GPU was waiting for the CPU. For 650M, whose larger kernels already keep the GPU busy, they add almost nothing.
+4. **Fused attention kernels are essential.** Unfused (math) attention is 1.4–2.2× slower than the default kernel, more so for longer sequences. cuDNN attention is not consistently better than the default memory-efficient kernel (0.77–1.45×), and its output differs slightly (maximum absolute difference up to 0.24). FlashAttention is not included in PyTorch's Windows build.
+5. **Sorting real proteins by length almost doubles throughput.** With unsorted batches, 46% of computed tokens are padding. Sorting by length brings padding efficiency to 99% and makes the whole dataset **1.88× faster**, with no change to the model. A token budget gives the same speed with 13% fewer batches and 21% lower peak memory (401 MB vs 510 MB), because batch size adapts to sequence length.
+6. **Laptop measurements are noisy at some shapes.** The noise control (`sdpa-efficient`, identical to eager) ranged from 0.71× to 1.47× on 4 of the 12 shapes, mostly at batch 1. Building a control into every comparison is what makes this visible, instead of reporting noise as a speed-up.
+
+These optimizations were measured separately. They target different overheads, so they should compound, but their combined effect hasn't been measured yet.
 <!-- RESULTS:END -->
 
 ## Project structure
@@ -143,11 +210,15 @@ ProteinPerf/
 │   ├── sequences.py      # Synthetic proteins and FASTA reading
 │   ├── benchmark.py      # Latency, throughput and memory measurement
 │   ├── profiling.py      # PyTorch Profiler breakdown by operator category
+│   ├── variants.py       # torch.compile, CUDA graphs and attention backend variants
+│   ├── batching.py       # Batching strategies for mixed-length proteins
 │   ├── report.py         # Charts and summary tables
 │   └── environment.py    # Hardware and software details for each result
+├── data/                 # 2,000 real human proteins from UniProtKB/Swiss-Prot
 ├── tests/                # Unit tests (run on CPU with a tiny ESM model)
 ├── results/
 │   ├── baseline.csv/.json # Raw benchmark data with environment metadata
+│   ├── optimizations.csv/.json, batching.csv/.json  # Phase 3 results
 │   ├── charts/           # Throughput, speed-up and memory charts
 │   └── profiles/         # GPU time breakdowns per configuration
 ├── docs/
@@ -162,7 +233,7 @@ ProteinPerf/
 |---|---|---|
 | 1. Baseline and profiling | ✅ Done | Benchmarks across models, precisions, batch sizes and lengths; operator-level profiling |
 | 2. Compute and memory analysis | Planned | FLOPs and bytes per layer, arithmetic intensity, roofline charts |
-| 3. Framework-level optimization | Planned | `torch.compile` (Inductor), attention backends, length-bucketed batching |
+| 3. Framework-level optimization | ✅ Done | `torch.compile` (Inductor), CUDA graphs, attention backends, length-sorted and token-budget batching |
 | 4. Custom Triton kernels | Planned | Fused LayerNorm and GELU, rotary embeddings, a tiled matmul, compared with cuBLAS |
 | 5. Profiling assistant | Planned | An LLM agent that explains profiler results and suggests optimizations |
 | Future | | AMD GPUs (ROCm), multi-GPU scaling, protein structure models |
@@ -180,7 +251,7 @@ Kernels will be written in [Triton](https://github.com/triton-lang/triton), whic
 
 MIT License. See [LICENSE](LICENSE).
 
-ESM-2 models are released by Meta under the MIT License.
+ESM-2 models are released by Meta under the MIT License. Protein sequences in `data/` come from [UniProt](https://www.uniprot.org) (UniProtKB/Swiss-Prot) under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## Author
 
