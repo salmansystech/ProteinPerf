@@ -165,7 +165,7 @@ GPU timings vary with power, temperature and background activity, especially on 
 |---|---|
 | **Plug in the charger** | On battery, laptop GPUs run at much lower power limits. |
 | **Use a high-performance power mode** | Windows: Settings → System → Power → **Best performance**. Vendor tools (for example Armoury Crate or Lenovo Vantage) often have their own performance mode too. |
-| **Close GPU-heavy apps** | Browsers with video, games and other ML jobs compete for the GPU. |
+| **Close GPU-heavy apps** | Browsers with video, games, VR software and local LLM apps (for example LM Studio) compete for GPU memory and compute. Check `nvidia-smi`: memory in use should be a few hundred MB before you start. |
 | **Don't run anything else during a benchmark** | Even CPU-only work adds launch delays, which matters most for small models. |
 | **Compare within one run** | Configurations measured back to back under the same conditions are comparable. Across days, re-run the baseline. |
 | **Look at p90 as well as the median** | A large gap means noisy measurements; re-run with more `--iters`. |
@@ -254,5 +254,7 @@ GPU benchmarks are run manually on real hardware, and their results are committe
 | Model download is slow or fails | Weights come from Hugging Face. Retry, or set `HF_HOME` to a drive with more space. Downloaded models are cached and reused. |
 | Very different numbers between runs | See [Getting reliable benchmark numbers](#7-getting-reliable-benchmark-numbers): check power mode, charger and background apps. |
 | `UserWarning: Profiler clears events at the end of each cycle` | Harmless. The profiler reports on the passes inside the profiling block, which is what ProteinPerf uses. |
+| `exceeded GPU memory, timing not valid` | The configuration needed more memory than the GPU has, and Windows spilled into system RAM. The result is saved with `exceeds_gpu_memory: true` and left out of charts. Use a smaller batch or length, or FP16. Closing other apps that use GPU memory also helps. |
+| `GPU memory still allocated after unloading` is far above 0 MB | Something still references the previous model. Check for references kept in lists, closures or exception tracebacks. |
 | BF16 results missing or very slow | BF16 needs compute capability 8.0+ (Ampere or newer). Check `bf16_supported` in `python -m proteinperf info`. |
 | `nvidia-smi` not found in WSL2 | Update the Windows NVIDIA driver and run `wsl --update` in PowerShell. Don't install a Linux driver inside WSL. |

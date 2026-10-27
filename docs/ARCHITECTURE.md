@@ -172,6 +172,9 @@ sequenceDiagram
 | **Inputs prepared once** | Tokenization and host-to-device copies are excluded, so the measurement is model compute only. |
 | **Peak memory** | `torch.cuda.max_memory_allocated()` after resetting statistics: the most memory the forward passes needed, including activations. |
 | **Out-of-memory handling** | A configuration that doesn't fit is reported and skipped, the cache is cleared, and the run continues. |
+| **Spill detection** | Windows can silently spill GPU memory into system RAM instead of raising an out-of-memory error. Reserved memory above 90% of the GPU's capacity flags the result as invalid. |
+| **Releasing models between runs** | Hugging Face models contain reference cycles, so a deleted model stays in GPU memory until garbage collection runs. The benchmark calls `gc.collect()` before `torch.cuda.empty_cache()` and prints the memory still allocated, so a leak shows up immediately. |
+| **Results saved continuously** | Results are written after every configuration, so a long run can be stopped without losing data. |
 
 **Reported metrics**
 
@@ -182,6 +185,8 @@ sequenceDiagram
 | `sequences_per_s` | batch size ÷ median latency |
 | `tokens_per_s` | batch size × (length + 2) ÷ median latency |
 | `peak_memory_mb` | Peak allocated GPU memory during the measured passes |
+| `peak_reserved_mb` | Peak memory reserved by PyTorch's caching allocator (allocated plus cached blocks) |
+| `exceeds_gpu_memory` | `True` when reserved memory passed 90% of the GPU's total memory. On Windows, the NVIDIA driver can then spill into system RAM instead of failing, which makes the timing meaningless. Such results are excluded from charts and tables. |
 
 On a CPU (used in tests), `time.perf_counter()` replaces CUDA events and memory is reported as 0.
 
