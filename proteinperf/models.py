@@ -9,6 +9,15 @@ class ModelSpec:
     layers: int
     hidden_size: int
     parameters: str
+    heads: int = 20
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.heads
+
+    @property
+    def intermediate_size(self) -> int:
+        return 4 * self.hidden_size
 
 # ESM-2 family (Lin et al., 2023). All are free to download from Hugging Face.
 ESM2_MODELS: Dict[str, ModelSpec] = {
@@ -16,7 +25,7 @@ ESM2_MODELS: Dict[str, ModelSpec] = {
     "35M": ModelSpec("facebook/esm2_t12_35M_UR50D", 12, 480, "35M"),
     "150M": ModelSpec("facebook/esm2_t30_150M_UR50D", 30, 640, "150M"),
     "650M": ModelSpec("facebook/esm2_t33_650M_UR50D", 33, 1280, "650M"),
-    "3B": ModelSpec("facebook/esm2_t36_3B_UR50D", 36, 2560, "3B"),
+    "3B": ModelSpec("facebook/esm2_t36_3B_UR50D", 36, 2560, "3B", heads=40),
 }
 
 DTYPES = {
