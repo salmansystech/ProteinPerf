@@ -1,6 +1,7 @@
 """Command-line interface: python -m proteinperf <command>"""
 import argparse
 import csv
+import gc
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,9 +65,14 @@ def cmd_benchmark(args):
                     print(f"  batch {batch_size:>3} x len {seq_len:>4}: {result.latency_ms:8.2f} ms  "
                           f"{result.sequences_per_s:8.1f} seq/s  {result.tokens_per_s:10.0f} tok/s  "
                           f"{result.peak_memory_mb:7.0f} MB", flush=True)
-            del model
+            # Hugging Face models contain reference cycles, so the old model is only
+            # freed after garbage collection. Without this, each model stays in GPU
+            # memory, inflating later memory numbers and eventually spilling to RAM.
+            del model, tokenizer
+            gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
+                print(f"  GPU memory still allocated after unloading: {torch.cuda.memory_allocated() / 2**20:.0f} MB", flush=True)
 
     if rows:
         print(f"\nSaved {len(rows)} results to {output} and {output.with_suffix('.json')}")
