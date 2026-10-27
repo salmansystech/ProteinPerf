@@ -22,6 +22,8 @@ Protein language models like ESM-2 are used across drug discovery and biology to
 |---|---|
 | **Benchmarking** | GPU timing with CUDA events, warm-up runs, median and p90 latency, throughput in sequences and tokens per second, peak GPU memory, and out-of-memory handling |
 | **Profiling** | PyTorch Profiler breakdown by operator category, the slowest operators, and a full trace you can open in Perfetto |
+| **Optimization** | `torch.compile`, CUDA graphs, attention backends and length-aware batching, each checked for accuracy against eager mode |
+| **Custom GPU kernels** | Triton kernels for rotary embeddings, GELU and a matmul with fused bias + GELU, tested against PyTorch and benchmarked against PyTorch, `torch.compile` and cuBLAS |
 | **Reporting** | Throughput, speed-up and memory charts, plus Markdown summary tables |
 | **Reproducibility** | Every result records the GPU, driver, CUDA, PyTorch and Transformers versions and the benchmark settings |
 | **Realistic inputs** | Synthetic proteins with natural amino acid composition (UniProtKB/Swiss-Prot), or your own FASTA file |
@@ -64,6 +66,9 @@ python -m proteinperf optimize --models 150M --dtype fp16
 # Compare batching strategies on 1,000 real proteins
 python -m proteinperf batching --model 150M --dtype fp16
 
+# Microbenchmark the custom Triton kernels
+python -m proteinperf kernels --models 150M,650M
+
 # Charts and summary tables from the results
 python -m proteinperf report --input results/benchmark.json
 ```
@@ -81,7 +86,8 @@ Full setup instructions, including WSL2 for the Triton work, are in the [Develop
 | `profile` | GPU time by operator category and the slowest operators, plus a trace file | `--model`, `--dtype`, `--batch-size`, `--seq-len`, `--iters` |
 | `optimize` | Compares `torch.compile`, CUDA graphs and attention backends with eager mode, including accuracy | `--models`, `--dtype`, `--variants`, `--batch-sizes`, `--seq-lens` |
 | `batching` | Compares batching strategies on real proteins of different lengths | `--fasta`, `--limit`, `--model`, `--dtype`, `--batch-size`, `--max-tokens` |
-| `report` | Charts and Markdown tables for benchmark, optimization and batching results | `--input`, `--optimizations`, `--batching`, `--output-dir` |
+| `kernels` | Microbenchmarks the custom Triton kernels against PyTorch eager and `torch.compile` | `--models`, `--dtype`, `--batch-size`, `--seq-len` |
+| `report` | Charts and Markdown tables for all results | `--input`, `--optimizations`, `--batching`, `--kernels`, `--kernel-variants`, `--output-dir` |
 
 Run `python -m proteinperf <command> --help` for every option.
 
@@ -198,6 +204,67 @@ Conclusions use only the shapes where the noise control stayed within 10% of 1.0
 6. **Laptop measurements are noisy at some shapes.** The noise control (`sdpa-efficient`, identical to eager) ranged from 0.71× to 1.47× on 4 of the 12 shapes, mostly at batch 1. Building a control into every comparison is what makes this visible, instead of reporting noise as a speed-up.
 
 These optimizations were measured separately. They target different overheads, so they should compound, but their combined effect hasn't been measured yet.
+
+### Custom Triton kernels (phase 4)
+
+Three hand-written [Triton](https://github.com/triton-lang/triton) kernels replace the operations that phase 1 profiling identified as bottlenecks ([how they work](docs/ARCHITECTURE.md#11-custom-triton-kernels-phase-4)):
+
+| Kernel | Replaces |
+|---|---|
+| **Fused rotary embedding** ([`rotary.py`](proteinperf/kernels/rotary.py)) | Hugging Face's FP32 casts, `rotate_half` (slice, negate, concatenate), multiplies, adds and casts back for queries and keys, in one launch |
+| **Fused GELU** ([`gelu.py`](proteinperf/kernels/gelu.py)) | The 5 elementwise operations of ESM-2's exact GELU |
+| **Tiled matmul with fused bias + GELU** ([`matmul.py`](proteinperf/kernels/matmul.py)) | The feed-forward up-projection (cuBLAS) and the GELU after it, applying bias and GELU in the matmul's epilogue; autotuned tile sizes |
+
+**Kernel microbenchmarks** at the layer shapes of batch 8 × 512 (FP16). Bandwidth is shown as a percentage of the 357 GB/s measured for a large device-to-device copy, the practical ceiling of this GPU. Raw data: [`results/kernels.csv`](results/kernels.csv).
+
+| Model | Kernel | Eager | torch.compile | Triton | vs eager | vs compile | Throughput | Max diff |
+|---|---|---|---|---|---|---|---|---|
+| 150M | Rotary embedding | 0.972 ms | 0.068 ms | 0.067 ms | 14.60× | 1.02× | 324 GB/s (91%) | 0.0000 |
+| 150M | GELU | 0.667 ms | 0.121 ms | 0.123 ms | 5.43× | 0.98× | 343 GB/s (96%) | 0.0020 |
+| 150M | Matmul (feed-forward up-projection) | 0.516 ms | 0.518 ms | 0.495 ms | 1.04× | 1.05× | 27.2 TFLOPS | 0.0000 |
+| 150M | Matmul + bias + GELU | 1.205 ms | 0.645 ms | 0.553 ms | 2.18× | 1.17× | 24.4 TFLOPS | 0.0039 |
+| 650M | Rotary embedding | 2.005 ms | 0.181 ms | 0.126 ms | 15.92× | 1.44× | 343 GB/s (96%) | 0.0000 |
+| 650M | GELU | 1.316 ms | 0.239 ms | 0.242 ms | 5.44× | 0.99× | 348 GB/s (98%) | 0.0020 |
+| 650M | Matmul (feed-forward up-projection) | 2.038 ms | 2.018 ms | 2.011 ms | 1.01× | 1.00× | 26.8 TFLOPS | 0.0000 |
+| 650M | Matmul + bias + GELU | 3.459 ms | 2.347 ms | 2.631 ms | 1.31× | 0.89× | 20.5 TFLOPS | 0.0039 |
+
+The eager matmul is cuBLAS, so the matmul rows compare the Triton kernel directly with NVIDIA's library.
+
+**Whole-model speed-up over eager** (FP16; ⚠ marks shapes where the noise control deviated by more than 10%). `triton` combines the rotary kernel and the fused feed-forward kernel. Raw data: [`results/kernel_variants.csv`](results/kernel_variants.csv).
+
+**ESM-2 150M**
+
+| Batch × length | Eager | `compile` | `sdpa-efficient` | `triton-rotary` | `triton-gelu` | `triton-ffn` | `triton` |
+|---|---|---|---|---|---|---|---|
+| 1 × 256 | 37.7 ms | 3.24× | 1.07× | 1.37× | 1.06× | 0.93× | 1.34× |
+| 1 × 512 | 39.5 ms | 2.04× | 1.04× | 1.25× | 1.05× | 1.03× | 1.28× |
+| 8 × 256 | 65.5 ms | 1.61× | 0.91× | 1.06× | 0.86× | 0.76× | 0.95× |
+| 8 × 512 ⚠ | 142.7 ms | 1.62× | 0.76× | 0.89× | 0.81× | 0.83× | 1.04× |
+| 32 × 256 ⚠ | 292.0 ms | 1.91× | 0.88× | 1.10× | 0.98× | 0.99× | 1.27× |
+| 32 × 512 | 719.6 ms | 1.32× | 1.00× | 1.22× | 1.11× | 1.13× | 1.42× |
+
+**ESM-2 650M**
+
+| Batch × length | Eager | `compile` | `sdpa-efficient` | `triton-rotary` | `triton-gelu` | `triton-ffn` | `triton` |
+|---|---|---|---|---|---|---|---|
+| 1 × 256 ⚠ | 47.5 ms | 1.91× | 1.21× | 1.50× | 1.24× | 1.14× | 1.33× |
+| 1 × 512 | 89.2 ms | 2.28× | 1.00× | 1.16× | 1.07× | 1.06× | 1.22× |
+| 8 × 256 ⚠ | 240.6 ms | 1.68× | 0.88× | 1.03× | 0.95× | 0.95× | 1.12× |
+| 8 × 512 | 559.9 ms | 1.23× | 1.00× | 1.15× | 1.08× | 1.08× | 1.24× |
+| 32 × 256 | 1043.0 ms | 1.24× | 1.00× | 1.15× | 1.08× | 1.09× | 1.27× |
+| 32 × 512 | 2110.2 ms | 1.24× | 1.01× | 1.16× | 1.09× | 1.09× | 1.27× |
+
+![Custom Triton kernels vs torch.compile](results/charts/kernels.png)
+
+### Phase 4 findings
+
+1. **The kernels run close to the hardware limit.** The rotary and GELU kernels reach 91–98% of the GPU's measured copy bandwidth. They're memory-bound, so this is about as fast as they can go on this GPU.
+2. **The fused rotary kernel is 15× faster than Hugging Face's code and exact.** Its output is identical (cosine similarity 1.000000, mean difference 0), because it does the same FP32 math, without the casts, slices and concatenations. At the 650M shapes it's also 1.44× faster than `torch.compile`'s generated kernel. It also removes the FP32 casts in Hugging Face's rotary code (`q.float()`, `.to(original_dtype)`), which most likely explain the extra copy operations found in phase 1. In the whole model, it speeds up every reliable shape by 1.06–1.37×.
+3. **The hand-written matmul matches cuBLAS.** At the feed-forward shapes it runs at 27 TFLOPS, 0.93–2.15× the speed of cuBLAS across all 12 tested sizes and within about 7% where it's slower. Fusing bias and GELU into its epilogue makes the up-projection plus GELU 1.27–2.18× faster than PyTorch in isolation, at every shape.
+4. **For the 650M model at batch 8 and above, the custom kernels match `torch.compile` without compiling.** `triton` reaches 1.24–1.27× against `compile`'s 1.23–1.24×, and takes effect immediately instead of after a 5–28 second compilation. For 150M at batch 32 × 512 it's 1.42× against 1.32×.
+5. **At small batches, `torch.compile` wins.** At batch 1 it's 2.0–3.2× faster than eager, against 1.2–1.3× for the custom kernels. Compiling fuses every small operation in the model and cuts launch overhead, while the custom kernels only replace the rotary and feed-forward operations. The two approaches are complementary.
+6. **Accuracy holds.** The GELU and feed-forward kernels compute GELU in FP32, where Hugging Face computes it in FP16, so their embeddings differ by FP16 rounding (lowest cosine similarity 0.996, mean difference at most 0.003), similar to `torch.compile`.
+7. **One result doesn't fit.** For 150M at batch 8 × 256, the GELU and feed-forward kernels made the model 0.76–0.86× as fast, although in isolation both kernels are faster at that exact shape (fused matmul + GELU 1.90×). The noise control also ran 9% slow there, just inside the 10% threshold, so this is most likely noise, but it hasn't been confirmed with a re-run.
 <!-- RESULTS:END -->
 
 ## Project structure
@@ -212,6 +279,7 @@ ProteinPerf/
 │   ├── profiling.py      # PyTorch Profiler breakdown by operator category
 │   ├── variants.py       # torch.compile, CUDA graphs and attention backend variants
 │   ├── batching.py       # Batching strategies for mixed-length proteins
+│   ├── kernels/          # Custom Triton kernels: rotary, GELU, matmul with fused epilogue
 │   ├── report.py         # Charts and summary tables
 │   └── environment.py    # Hardware and software details for each result
 ├── data/                 # 2,000 real human proteins from UniProtKB/Swiss-Prot
@@ -219,6 +287,7 @@ ProteinPerf/
 ├── results/
 │   ├── baseline.csv/.json # Raw benchmark data with environment metadata
 │   ├── optimizations.csv/.json, batching.csv/.json  # Phase 3 results
+│   ├── kernels.csv/.json, kernel_variants.csv/.json # Phase 4 results
 │   ├── charts/           # Throughput, speed-up and memory charts
 │   └── profiles/         # GPU time breakdowns per configuration
 ├── docs/
@@ -234,11 +303,11 @@ ProteinPerf/
 | 1. Baseline and profiling | ✅ Done | Benchmarks across models, precisions, batch sizes and lengths; operator-level profiling |
 | 2. Compute and memory analysis | Planned | FLOPs and bytes per layer, arithmetic intensity, roofline charts |
 | 3. Framework-level optimization | ✅ Done | `torch.compile` (Inductor), CUDA graphs, attention backends, length-sorted and token-budget batching |
-| 4. Custom Triton kernels | Planned | Fused LayerNorm and GELU, rotary embeddings, a tiled matmul, compared with cuBLAS |
+| 4. Custom Triton kernels | ✅ Done | Fused rotary embedding, fused GELU, and a tiled matmul with fused bias + GELU, compared with PyTorch, `torch.compile` and cuBLAS |
 | 5. Profiling assistant | Planned | An LLM agent that explains profiler results and suggests optimizations |
 | Future | | AMD GPUs (ROCm), multi-GPU scaling, protein structure models |
 
-Kernels will be written in [Triton](https://github.com/triton-lang/triton), which compiles for both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+The kernels are written in [Triton](https://github.com/triton-lang/triton), which compiles for both NVIDIA (CUDA) and AMD (ROCm) GPUs. They have only been tested on NVIDIA so far.
 
 ## Documentation
 
