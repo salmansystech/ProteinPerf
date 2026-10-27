@@ -11,7 +11,8 @@ def test_unknown_variant():
         build_variant(torch.nn.Identity(), "turbo")
 
 def test_every_variant_is_described():
-    assert {"eager", "compile", "compile-cudagraphs", "sdpa-efficient", "sdpa-cudnn", "sdpa-flash", "sdpa-math"} == set(VARIANTS)
+    assert {"eager", "compile", "compile-cudagraphs", "sdpa-efficient", "sdpa-cudnn", "sdpa-flash", "sdpa-math",
+            "triton-rotary", "triton-gelu", "triton-ffn", "triton"} == set(VARIANTS)
 
 def test_math_attention_matches_default(tiny_model, tokenizer):
     inputs = tokenizer(synthetic_sequences(2, 20), return_tensors="pt", padding=True)
