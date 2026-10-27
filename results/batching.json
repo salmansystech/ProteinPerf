@@ -1,0 +1,61 @@
+{
+  "metadata": {
+    "timestamp": "2026-10-27T15:40:19+00:00",
+    "environment": {
+      "python": "3.13.13",
+      "os": "Windows-11-10.0.26200-SP0",
+      "torch": "2.11.0+cu128",
+      "transformers": "5.21.0",
+      "cuda_available": true,
+      "gpu": "NVIDIA GeForce RTX 3070 Laptop GPU",
+      "gpu_memory_gb": 8.0,
+      "compute_capability": "8.6",
+      "multiprocessors": 40,
+      "cuda": "12.8",
+      "bf16_supported": true
+    },
+    "settings": {
+      "model": "150M",
+      "dtype": "fp16",
+      "fasta": "data/uniprot_human_sample.fasta",
+      "sequences": 1000,
+      "batch_size": 8,
+      "max_tokens": 4096
+    }
+  },
+  "results": [
+    {
+      "strategy": "unsorted",
+      "sequences": 1000,
+      "batches": 125,
+      "total_s": 36.56433780002408,
+      "sequences_per_s": 27.34905266079621,
+      "real_tokens_per_s": 11191.478490271757,
+      "padding_efficiency": 0.5424527551539832,
+      "peak_memory_mb": 509.759765625,
+      "speedup_vs_unsorted": 1.0
+    },
+    {
+      "strategy": "sorted",
+      "sequences": 1000,
+      "batches": 125,
+      "total_s": 19.442953799967654,
+      "sequences_per_s": 51.432514333375806,
+      "real_tokens_per_s": 21046.647757846382,
+      "padding_efficiency": 0.9917813863305865,
+      "peak_memory_mb": 505.4169921875,
+      "speedup_vs_unsorted": 1.8805958279901331
+    },
+    {
+      "strategy": "token-budget",
+      "sequences": 1000,
+      "batches": 109,
+      "total_s": 19.42813179991208,
+      "sequences_per_s": 51.471752935324716,
+      "real_tokens_per_s": 21062.70454691129,
+      "padding_efficiency": 0.9886758992597174,
+      "peak_memory_mb": 401.19140625,
+      "speedup_vs_unsorted": 1.8820305614865935
+    }
+  ]
+}
