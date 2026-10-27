@@ -7,7 +7,7 @@ Everything you need to set up ProteinPerf, run it, get reliable numbers, and ext
 1. [Requirements](#1-requirements)
 2. [Setup on Windows](#2-setup-on-windows)
 3. [Setup on Linux](#3-setup-on-linux)
-4. [Setup on WSL2 (for Triton)](#4-setup-on-wsl2-for-triton)
+4. [Setup on WSL2 (optional)](#4-setup-on-wsl2-optional)
 5. [Running the tests](#5-running-the-tests)
 6. [Using the CLI](#6-using-the-cli)
 7. [Getting reliable benchmark numbers](#7-getting-reliable-benchmark-numbers)
@@ -34,7 +34,7 @@ The tests run on any machine with no GPU.
 
 ## 2. Setup on Windows
 
-Native Windows supports everything in phase 1: benchmarking, profiling and reporting.
+Native Windows supports everything, including `torch.compile` through the community [`triton-windows`](https://github.com/woct0rdho/triton-windows) build, which `requirements.txt` installs automatically on Windows.
 
 ```powershell
 git clone https://github.com/salmansystech/ProteinPerf.git
@@ -72,9 +72,11 @@ python -m proteinperf info
 
 ---
 
-## 4. Setup on WSL2 (for Triton)
+## 4. Setup on WSL2 (optional)
 
-Triton, and `torch.compile` which uses it, officially support Linux. On Windows, use WSL2: a Linux environment that can use your NVIDIA GPU directly. This is needed from phase 3 onward.
+Triton officially supports Linux. On Windows, `triton-windows` works for this project, but WSL2 gives you the official Linux stack (including FlashAttention, which PyTorch's Windows build doesn't include). WSL2 is a Linux environment that can use your NVIDIA GPU directly.
+
+> Don't compare numbers measured on Windows with numbers measured in WSL2: the operating system and driver path differ. Measure all variants in the same environment.
 
 1. **Install a Linux distribution** in PowerShell (administrator rights may be needed the first time):
    ```powershell
@@ -146,6 +148,24 @@ python -m proteinperf profile --model 150M --dtype fp16 --batch-size 8 --seq-len
 ```
 
 Prints GPU time per forward pass by category and the slowest operators, and saves a trace to `results/traces/`. Open the trace at [ui.perfetto.dev](https://ui.perfetto.dev) (drag the file in) to see a timeline of every operator and kernel.
+
+### Optimize (phase 3)
+
+```bash
+python -m proteinperf optimize --models 150M,650M --dtype fp16 --batch-sizes 1,8,32 --seq-lens 256,512
+```
+
+For every model and shape, measures eager mode first, then each variant (`compile`, `compile-cudagraphs`, `sdpa-efficient`, `sdpa-cudnn`, `sdpa-flash`, `sdpa-math`), with its speed-up over eager, first-call (compilation) time and output difference from eager. Choose variants with `--variants compile,sdpa-math`. Results go to `results/optimizations.csv` and `.json`.
+
+Compiling takes 5–40 seconds per variant and shape, so large grids take a while. Compiled kernels are cached, so repeated runs compile faster.
+
+### Batching (phase 3)
+
+```bash
+python -m proteinperf batching --model 150M --dtype fp16 --limit 1000 --batch-size 8 --max-tokens 4096
+```
+
+Embeds the first `--limit` proteins of `data/uniprot_human_sample.fasta` (or `--fasta your.fasta`) with each batching strategy and reports total time, throughput and padding efficiency.
 
 ### Report
 
@@ -257,4 +277,6 @@ GPU benchmarks are run manually on real hardware, and their results are committe
 | `exceeded GPU memory, timing not valid` | The configuration needed more memory than the GPU has, and Windows spilled into system RAM. The result is saved with `exceeds_gpu_memory: true` and left out of charts. Use a smaller batch or length, or FP16. Closing other apps that use GPU memory also helps. |
 | `GPU memory still allocated after unloading` is far above 0 MB | Something still references the previous model. Check for references kept in lists, closures or exception tracebacks. |
 | BF16 results missing or very slow | BF16 needs compute capability 8.0+ (Ampere or newer). Check `bf16_supported` in `python -m proteinperf info`. |
+| `torch.compile` fails with a Triton or compiler error on Windows | Check `pip show triton-windows`: its version must match PyTorch (Triton 3.7 for PyTorch 2.11). Reinstall with `pip install "triton-windows>=3.7,<3.8"`. |
+| `sdpa-flash not available on this GPU/build` | PyTorch's Windows build doesn't include FlashAttention. Use WSL2 or Linux to test it. |
 | `nvidia-smi` not found in WSL2 | Update the Windows NVIDIA driver and run `wsl --update` in PowerShell. Don't install a Linux driver inside WSL. |
