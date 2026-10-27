@@ -1,0 +1,134 @@
+{
+  "metadata": {
+    "timestamp": "2026-10-27T16:41:48+00:00",
+    "environment": {
+      "python": "3.13.13",
+      "os": "Windows-11-10.0.26200-SP0",
+      "torch": "2.11.0+cu128",
+      "transformers": "5.21.0",
+      "cuda_available": true,
+      "gpu": "NVIDIA GeForce RTX 3070 Laptop GPU",
+      "gpu_memory_gb": 8.0,
+      "compute_capability": "8.6",
+      "multiprocessors": 40,
+      "cuda": "12.8",
+      "bf16_supported": true
+    },
+    "settings": {
+      "dtype": "fp16",
+      "batch_size": 8,
+      "seq_len": 512,
+      "measured_bandwidth_gbs": 356.77985378572373
+    }
+  },
+  "results": [
+    {
+      "model": "150M",
+      "kernel": "rotary",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 0.971776008605957,
+      "compiled_ms": 0.06758400052785873,
+      "triton_ms": 0.06656000018119812,
+      "speedup_vs_eager": 14.600000089550248,
+      "speedup_vs_compile": 1.0153846205509758,
+      "max_abs_diff": 0.0,
+      "triton_gbs": 324.21538373276417,
+      "bandwidth_utilization": 0.9087267128246618
+    },
+    {
+      "model": "150M",
+      "kernel": "gelu",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 0.6666240096092224,
+      "compiled_ms": 0.12083200365304947,
+      "triton_ms": 0.1228799968957901,
+      "speedup_vs_eager": 5.425000215247085,
+      "speedup_vs_compile": 0.9833333879030168,
+      "max_abs_diff": 0.001953125,
+      "triton_gbs": 342.666675323155,
+      "bandwidth_utilization": 0.9604428940905254
+    },
+    {
+      "model": "150M",
+      "kernel": "matmul",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 0.5160959959030151,
+      "compiled_ms": 0.5181440114974976,
+      "triton_ms": 0.49459201097488403,
+      "speedup_vs_eager": 1.0434782294314557,
+      "speedup_vs_compile": 1.0476190476190477,
+      "max_abs_diff": 0.0,
+      "triton_tflops": 27.24306357767723
+    },
+    {
+      "model": "150M",
+      "kernel": "matmul+gelu",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 1.2052479982376099,
+      "compiled_ms": 0.6451200246810913,
+      "triton_ms": 0.5529599785804749,
+      "speedup_vs_eager": 2.179629710872836,
+      "speedup_vs_compile": 1.1666667564933073,
+      "max_abs_diff": 0.00390625,
+      "triton_tflops": 24.36740835130627
+    },
+    {
+      "model": "650M",
+      "kernel": "rotary",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 2.0049920082092285,
+      "compiled_ms": 0.1812479943037033,
+      "triton_ms": 0.12595200538635254,
+      "speedup_vs_eager": 15.918698571404233,
+      "speedup_vs_compile": 1.4390242834779219,
+      "max_abs_diff": 0.0,
+      "triton_gbs": 342.6666520124858,
+      "bandwidth_utilization": 0.9604428287542434
+    },
+    {
+      "model": "650M",
+      "kernel": "gelu",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 1.3158400058746338,
+      "compiled_ms": 0.2385919988155365,
+      "triton_ms": 0.24166400730609894,
+      "speedup_vs_eager": 5.444915113933169,
+      "speedup_vs_compile": 0.9872881008437829,
+      "max_abs_diff": 0.001953125,
+      "triton_gbs": 348.47456573594053,
+      "bandwidth_utilization": 0.9767215330079393
+    },
+    {
+      "model": "650M",
+      "kernel": "matmul",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 2.037760019302368,
+      "compiled_ms": 2.0183041095733643,
+      "triton_ms": 2.011136054992676,
+      "speedup_vs_eager": 1.013238271097372,
+      "speedup_vs_compile": 1.0035641818279244,
+      "max_abs_diff": 0.0,
+      "triton_tflops": 26.799184603249667
+    },
+    {
+      "model": "650M",
+      "kernel": "matmul+gelu",
+      "batch_size": 8,
+      "seq_len": 512,
+      "eager_ms": 3.4590721130371094,
+      "compiled_ms": 2.347007989883423,
+      "triton_ms": 2.6306560039520264,
+      "speedup_vs_eager": 1.3149085657115778,
+      "speedup_vs_compile": 0.8921759387610999,
+      "max_abs_diff": 0.00390625,
+      "triton_tflops": 20.48797194275154
+    }
+  ]
+}
