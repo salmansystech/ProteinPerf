@@ -6,6 +6,8 @@ import json
 
 MODEL_ORDER = ["8M", "35M", "150M", "650M", "3B"]
 DTYPE_COLORS = {"fp32": "#64748b", "fp16": "#2563eb", "bf16": "#16a34a"}
+# BF16 is dashed so it stays visible where it overlaps FP16 (e.g. identical memory use)
+DTYPE_LINESTYLES = {"fp32": "-", "fp16": "-", "bf16": "--"}
 
 def load_results(path: str) -> dict:
     """Benchmark results and metadata from the JSON file written by `benchmark`"""
@@ -62,25 +64,25 @@ def plot_results(rows: List[dict], output_dir: str, batch_size: int = 8, title_s
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    suffix = f" ({title_suffix})" if title_suffix else ""
+    suffix = f"\n{title_suffix}" if title_suffix else ""
     models = [m for m in MODEL_ORDER if any(r["model"] == m for r in rows)]
     saved = []
 
     # 1. Throughput vs sequence length, one panel per model
-    fig, axes = plt.subplots(1, len(models), figsize=(4 * len(models), 3.6), squeeze=False)
+    fig, axes = plt.subplots(1, len(models), figsize=(4 * len(models), 3.9), squeeze=False)
     for ax, model in zip(axes[0], models):
         for dtype, color in DTYPE_COLORS.items():
             points = sorted((r["seq_len"], r["tokens_per_s"]) for r in rows
                             if r["model"] == model and r["dtype"] == dtype and r["batch_size"] == batch_size)
             if points:
-                ax.plot(*zip(*points), marker="o", color=color, label=dtype.upper())
+                ax.plot(*zip(*points), marker="o", color=color, linestyle=DTYPE_LINESTYLES[dtype], label=dtype.upper())
         ax.set_title(f"ESM-2 {model}")
         ax.set_xlabel("Sequence length")
         ax.set_xscale("log", base=2)
         ax.grid(alpha=0.3)
     axes[0][0].set_ylabel("Tokens / second")
     axes[0][0].legend()
-    fig.suptitle(f"Inference throughput, batch {batch_size}{suffix}")
+    fig.suptitle(f"Inference throughput, batch {batch_size}{suffix}", fontsize=11)
     fig.tight_layout()
     path = out / "throughput.png"
     fig.savefig(path, dpi=150)
@@ -93,7 +95,7 @@ def plot_results(rows: List[dict], output_dir: str, batch_size: int = 8, title_s
         grouped[(s["model"], s["dtype"])].append(s["speedup"])
     half = [d for d in ("fp16", "bf16") if any(k[1] == d for k in grouped)]
     if half:
-        fig, ax = plt.subplots(figsize=(7, 3.8))
+        fig, ax = plt.subplots(figsize=(7.5, 4))
         width = 0.8 / len(half)
         for i, dtype in enumerate(half):
             values = [sum(grouped[(m, dtype)]) / len(grouped[(m, dtype)]) if grouped[(m, dtype)] else 0 for m in models]
@@ -103,7 +105,7 @@ def plot_results(rows: List[dict], output_dir: str, batch_size: int = 8, title_s
         ax.axhline(1, color="#64748b", linestyle="--", linewidth=1)
         ax.set_xticks([x + width * (len(half) - 1) / 2 for x in range(len(models))], [f"ESM-2 {m}" for m in models])
         ax.set_ylabel("Speed-up over FP32")
-        ax.set_title(f"Half-precision speed-up (average over all batch sizes and lengths){suffix}")
+        ax.set_title(f"Half-precision speed-up over FP32, averaged over all batch sizes and lengths{suffix}", fontsize=10)
         ax.legend()
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
@@ -114,16 +116,16 @@ def plot_results(rows: List[dict], output_dir: str, batch_size: int = 8, title_s
 
     # 3. Peak memory vs sequence length for the largest model
     largest = models[-1]
-    fig, ax = plt.subplots(figsize=(7, 3.8))
+    fig, ax = plt.subplots(figsize=(7.5, 4))
     for dtype, color in DTYPE_COLORS.items():
         points = sorted((r["seq_len"], r["peak_memory_mb"] / 1024) for r in rows
                         if r["model"] == largest and r["dtype"] == dtype and r["batch_size"] == batch_size)
         if points:
-            ax.plot(*zip(*points), marker="o", color=color, label=dtype.upper())
+            ax.plot(*zip(*points), marker="o", color=color, linestyle=DTYPE_LINESTYLES[dtype], label=dtype.upper())
     ax.set_xlabel("Sequence length")
     ax.set_ylabel("Peak GPU memory (GB)")
     ax.set_xscale("log", base=2)
-    ax.set_title(f"ESM-2 {largest} peak memory, batch {batch_size}{suffix}")
+    ax.set_title(f"ESM-2 {largest} peak GPU memory, batch {batch_size}{suffix}", fontsize=10)
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
