@@ -1,0 +1,29 @@
+ESM-2 150M (fp32), batch 8 x length 512
+GPU time per forward pass: 334.98 ms
+
+Time by category:
+  Matmul         163.66 ms   48.9%  ####################
+  Attention       94.10 ms   28.1%  ###########
+  Elementwise     59.30 ms   17.7%  #######
+  Activation       7.82 ms    2.3%  #
+  Memory           5.47 ms    1.6%  #
+  LayerNorm        4.58 ms    1.4%  #
+  Other            0.05 ms    0.0%  
+
+Slowest operators:
+  aten::addmm                                   Matmul         163.66 ms    180 calls
+  aten::_efficient_attention_forward            Attention       94.10 ms     30 calls
+  aten::mul                                     Elementwise     29.49 ms    216 calls
+  aten::add                                     Elementwise     19.74 ms    151 calls
+  aten::div                                     Elementwise      7.89 ms     32 calls
+  aten::erf                                     Activation       7.82 ms     30 calls
+  aten::cat                                     Memory           5.36 ms     61 calls
+  aten::native_layer_norm                       LayerNorm        4.58 ms     61 calls
+  aten::neg                                     Elementwise      2.10 ms     60 calls
+  aten::copy_                                   Memory           0.10 ms      9 calls
+  aten::masked_fill_                            Elementwise      0.07 ms      1 calls
+  aten::gather                                  Other            0.03 ms      1 calls
+  aten::sum                                     Other            0.01 ms      2 calls
+  aten::cumsum                                  Memory           0.01 ms      1 calls
+  aten::all                                     Other            0.01 ms      1 calls
+

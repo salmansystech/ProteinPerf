@@ -1,0 +1,29 @@
+ESM-2 650M (fp16), batch 8 x length 512
+GPU time per forward pass: 361.32 ms
+
+Time by category:
+  Matmul         214.06 ms   59.2%  ########################
+  Elementwise     82.53 ms   22.8%  #########
+  Memory          31.00 ms    8.6%  ###
+  Attention       20.11 ms    5.6%  ##
+  Activation       8.76 ms    2.4%  #
+  LayerNorm        4.81 ms    1.3%  #
+  Other            0.05 ms    0.0%  
+
+Slowest operators:
+  aten::addmm                                   Matmul         214.06 ms    198 calls
+  aten::mul                                     Elementwise     41.50 ms    237 calls
+  aten::add                                     Elementwise     27.80 ms    166 calls
+  aten::copy_                                   Memory          20.50 ms    210 calls
+  aten::_efficient_attention_forward            Attention       20.11 ms     33 calls
+  aten::cat                                     Memory          10.50 ms     67 calls
+  aten::div                                     Elementwise      8.78 ms     35 calls
+  aten::erf                                     Activation       8.76 ms     33 calls
+  aten::native_layer_norm                       LayerNorm        4.81 ms     67 calls
+  aten::neg                                     Elementwise      4.36 ms     66 calls
+  aten::masked_fill_                            Elementwise      0.08 ms      1 calls
+  aten::gather                                  Other            0.03 ms      1 calls
+  aten::sum                                     Other            0.01 ms      2 calls
+  aten::cumsum                                  Memory           0.01 ms      1 calls
+  aten::all                                     Other            0.00 ms      1 calls
+
