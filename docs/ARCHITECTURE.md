@@ -13,7 +13,8 @@ This document explains how ProteinPerf is built and, just as importantly, how it
 7. [Results and reporting](#7-results-and-reporting)
 8. [Testing strategy](#8-testing-strategy)
 9. [Design decisions](#9-design-decisions)
-10. [Planned architecture](#10-planned-architecture)
+10. [Framework-level optimizations (phase 3)](#10-framework-level-optimizations-phase-3)
+11. [Planned architecture](#11-planned-architecture)
 
 ---
 
@@ -78,6 +79,8 @@ Models are loaded once per model and precision, then reused for every sequence l
 | `profiling.py` | Operator-level breakdown | `profile_inference()`, `summarize()`, `categorize()` |
 | `report.py` | Charts and tables | `speedups()`, `markdown_table()`, `plot_results()` |
 | `environment.py` | Reproducibility metadata | `environment_info()` |
+| `variants.py` | Framework-level optimizations (phase 3) | `build_variant()`, `output_difference()`, `VARIANTS` |
+| `batching.py` | Batching strategies for mixed-length proteins (phase 3) | `make_batches()`, `padding_stats()`, `run_dataset()` |
 | `cli.py` | Argument parsing and orchestration | `main()` and one `cmd_*` function per command |
 
 ```mermaid
@@ -88,6 +91,8 @@ flowchart TD
     cli --> profiling[profiling.py]
     cli --> report[report.py]
     cli --> environment[environment.py]
+    cli --> variants[variants.py]
+    cli --> batching[batching.py]
 ```
 
 The measurement modules (`benchmark.py`, `profiling.py`) take any PyTorch model and any callable tokenizer. They don't depend on `models.py`, which is what lets the tests run them with a tiny model, and will let later phases measure compiled models and custom kernels with the same code.
@@ -130,7 +135,7 @@ flowchart LR
 
 **Synthetic sequences** (`synthetic_sequences(count, length, seed)`) draw residues from the 20 standard amino acids, weighted by their frequency in UniProtKB/Swiss-Prot. This gives realistic token statistics, exact control over length, and reproducibility through the seed.
 
-**Equal lengths:** all sequences in a benchmark batch have the same length, so there's no padding. Each configuration measures exactly the work it names. Padding effects with real, mixed-length data will be studied in phase 3 (length-bucketed batching).
+**Equal lengths:** all sequences in a benchmark batch have the same length, so there's no padding. Each configuration measures exactly the work it names. Padding with real, mixed-length data is studied separately in phase 3 (see [section 10](#10-framework-level-optimizations-phase-3)).
 
 **FASTA files** (`read_fasta(path)`) load real proteins, joining multi-line sequences and skipping headers.
 
@@ -258,6 +263,8 @@ It also prints a Markdown table of sequences per second and peak memory, ready f
 | `test_benchmark.py` | Percentiles, warm-up and iteration counts, throughput and token arithmetic |
 | `test_profiling.py` | Operator categorization, kernel and bookkeeping events excluded, older PyTorch attribute names, a real profile run |
 | `test_report.py` | Speed-up calculation, Markdown table (including OOM cells), chart files |
+| `test_variants.py` | Variant construction, attention backend wrapper, output comparison |
+| `test_batching.py` | Every strategy covers each sequence once, sorting, token budgets, padding statistics, a dataset run |
 | `test_cli.py` | Argument validation |
 
 - **No GPU and no downloads:** `conftest.py` builds a 2-layer ESM model with random weights and a minimal tokenizer, so the real benchmark and profiler code runs on CPU in seconds.
@@ -281,7 +288,59 @@ It also prints a Markdown table of sequences per second and peak memory, ready f
 
 ---
 
-## 10. Planned architecture
+## 10. Framework-level optimizations (phase 3)
+
+Phase 3 adds two modules that reuse the same benchmark code, so every result is directly comparable with eager mode.
+
+### Model variants (`variants.py`)
+
+`build_variant(model, name)` returns the model optimized in one way, without changing its weights:
+
+| Variant | How | Targets |
+|---|---|---|
+| `eager` | The model as loaded | Baseline |
+| `compile` | `torch.compile(model)`: TorchDynamo captures the graph, Inductor generates fused Triton kernels | Elementwise and memory operations that were separate kernels |
+| `compile-cudagraphs` | `torch.compile(model, mode="reduce-overhead")`: also records the kernels into a CUDA graph and replays it with a single launch | CPU kernel-launch overhead |
+| `sdpa-efficient`, `sdpa-cudnn`, `sdpa-flash`, `sdpa-math` | `AttentionBackendModel` runs the model inside `torch.nn.attention.sdpa_kernel(backend)` | Choice of attention kernel |
+
+The `optimize` command runs them like this for every model and shape:
+
+```mermaid
+flowchart TD
+    A["Eager reference output<br/>(computed once)"] --> L
+    L{"For each variant<br/>(eager first)"} --> R["torch._dynamo.reset()"]
+    R --> B["build_variant()"]
+    B --> F["First call: timed separately<br/>(includes compilation)"]
+    F --> D["Compare output with the<br/>eager reference"]
+    D --> M["benchmark_inference()<br/>warm-up + timed runs"]
+    M --> S["Speed-up vs eager<br/>measured in the same session"]
+```
+
+| Practice | Why |
+|---|---|
+| **Eager measured in the same run** | Laptop GPU clocks vary between sessions (phase 1 measured 195 ms for a configuration that later took 128 ms), so speed-ups are only valid against a baseline measured minutes apart under the same conditions. |
+| **`torch._dynamo.reset()` before each variant** | Each variant and shape gets its own compiled graph, instead of reusing or recompiling one built for another shape. |
+| **First call timed separately** | Compilation takes seconds to tens of seconds. It's a one-off cost reported as `first_call_s`, not part of steady-state latency. |
+| **Accuracy checked for every variant** | A faster result only counts if the embeddings stay the same. Each variant's output is compared with eager: maximum and mean absolute difference, and the lowest per-token cosine similarity. |
+| **Unavailable backends skipped** | FlashAttention isn't included in PyTorch's Windows build. Such variants are reported as not available instead of failing the run. |
+
+### Batching strategies (`batching.py`)
+
+Real proteins vary in length, and every sequence in a batch is padded to the longest one, so padding wastes compute. `make_batches()` implements three strategies:
+
+| Strategy | Batches |
+|---|---|
+| `unsorted` | A fixed number of sequences, in dataset order |
+| `sorted` | A fixed number of sequences, after sorting by length |
+| `token-budget` | Sorted, then filled while `sequences × (longest length + 2)` stays within a token budget: many short proteins or a few long ones |
+
+`padding_stats()` reports **padding efficiency**: real tokens divided by tokens actually computed. `run_dataset()` tokenizes all batches first, runs warm-up batches, then times embedding the entire dataset.
+
+The input is `data/uniprot_human_sample.fasta`: 2,000 reviewed human proteins from UniProtKB/Swiss-Prot, randomly sampled (seed 0) from the 89% that fit ESM-2's 1022-residue limit. Lengths range from 8 to 1,021 residues (median 365).
+
+---
+
+## 11. Planned architecture
 
 Later phases plug into the same measurement pipeline:
 
@@ -297,6 +356,5 @@ flowchart LR
 | Phase | New modules (planned) |
 |---|---|
 | 2. Compute and memory analysis | `roofline.py`: FLOPs and bytes per layer from the model configuration, arithmetic intensity, and roofline charts against the GPU's peak compute and bandwidth |
-| 3. Framework-level optimization | Model variants: `torch.compile` modes, attention backends, and length-bucketed batching for mixed-length data |
 | 4. Custom kernels | `kernels/` with Triton kernels (fused LayerNorm and GELU, rotary embeddings, tiled matmul), tested for numerical correctness against PyTorch, then swapped into the model |
 | 5. Profiling assistant | An agent that reads profile reports and explains bottlenecks in plain language |
