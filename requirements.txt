@@ -3,3 +3,5 @@
 torch>=2.4
 transformers>=4.40
 matplotlib>=3.8
+# torch.compile needs Triton; Linux PyTorch wheels include it, Windows needs this community build
+triton-windows>=3.7,<3.8; sys_platform == "win32"
