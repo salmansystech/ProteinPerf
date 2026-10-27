@@ -11,7 +11,7 @@ from proteinperf.benchmark import benchmark_inference
 from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
-from proteinperf.report import load_results, markdown_table, plot_results
+from proteinperf.report import load_results, markdown_table, plot_results, valid_rows
 from proteinperf.sequences import synthetic_sequences
 
 RESULTS_DIR = Path("results")
@@ -104,7 +104,10 @@ def cmd_profile(args):
 
 def cmd_report(args):
     data = load_results(args.input)
-    rows = data["results"]
+    rows = valid_rows(data["results"])
+    excluded = len(data["results"]) - len(rows)
+    if excluded:
+        print(f"Excluded {excluded} result(s) that exceeded GPU memory")
     gpu = data.get("metadata", {}).get("environment", {}).get("gpu")
     
     for path in plot_results(rows, args.output_dir, batch_size=args.batch_size, title_suffix=gpu):

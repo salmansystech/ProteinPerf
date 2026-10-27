@@ -1,5 +1,5 @@
 import pytest
-from proteinperf.report import markdown_table, plot_results, speedups
+from proteinperf.report import markdown_table, plot_results, speedups, valid_rows
 
 def _row(model, dtype, batch, length, latency, memory):
     return {
@@ -46,3 +46,9 @@ def test_plot_results_saves_charts(tmp_path):
 
     assert [p.split("\\")[-1].split("/")[-1] for p in paths] == ["throughput.png", "speedup.png", "memory.png"]
     assert all((tmp_path / name).stat().st_size > 0 for name in ("throughput.png", "speedup.png", "memory.png"))
+
+def test_valid_rows_excludes_spilled_measurements():
+    spilled = dict(_row("650M", "fp32", 32, 1000, 135800.0, 5685), exceeds_gpu_memory=True)
+    older = _row("8M", "fp32", 8, 128, 10.0, 100)  # results saved before the flag existed
+    
+    assert valid_rows([spilled, older]) == [older]

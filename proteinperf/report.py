@@ -11,6 +11,10 @@ def load_results(path: str) -> dict:
     """Benchmark results and metadata from the JSON file written by `benchmark`"""
     return json.loads(Path(path).read_text())
 
+def valid_rows(rows: List[dict]) -> List[dict]:
+    """Results whose timings are meaningful (not spilled out of GPU memory)"""
+    return [r for r in rows if not r.get("exceeds_gpu_memory", False)]
+
 def _index(rows: List[dict]) -> Dict[tuple, dict]:
     return {(r["model"], r["dtype"], r["batch_size"], r["seq_len"]): r for r in rows}
 
