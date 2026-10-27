@@ -3,16 +3,19 @@ import argparse
 import csv
 import gc
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import torch
 
+from proteinperf.batching import STRATEGIES, run_dataset
 from proteinperf.benchmark import benchmark_inference
 from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
 from proteinperf.report import load_results, markdown_table, plot_results, valid_rows
-from proteinperf.sequences import synthetic_sequences
+from proteinperf.sequences import read_fasta, synthetic_sequences
+from proteinperf.variants import VARIANTS, build_variant, output_difference
 
 RESULTS_DIR = Path("results")
 
@@ -34,16 +37,29 @@ def _save_results(output: Path, rows: list, metadata: dict):
         writer.writerows(rows)
     output.with_suffix(".json").write_text(json.dumps({"metadata": metadata, "results": rows}, indent=2))
 
+def _release_gpu_memory(device: str):
+    """Free models that are no longer referenced, and report what remains allocated"""
+    # Hugging Face models contain reference cycles, so a deleted model is only
+    # freed after garbage collection. Without this, each model stays in GPU
+    # memory, inflating later memory numbers and eventually spilling to RAM.
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        print(f"  GPU memory still allocated after unloading: {torch.cuda.memory_allocated() / 2**20:.0f} MB", flush=True)
+
+def _metadata(**settings) -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "environment": environment_info(),
+        "settings": settings,
+    }
+
 def cmd_benchmark(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = []
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "environment": environment_info(),
-        "settings": {"warmup": args.warmup, "iters": args.iters, "seed": args.seed},
-    }
+    metadata = _metadata(warmup=args.warmup, iters=args.iters, seed=args.seed)
 
     for size in args.models:
         for dtype in args.dtypes:
@@ -67,14 +83,8 @@ def cmd_benchmark(args):
                     print(f"  batch {batch_size:>3} x len {seq_len:>4}: {result.latency_ms:8.2f} ms  "
                           f"{result.sequences_per_s:8.1f} seq/s  {result.tokens_per_s:10.0f} tok/s  "
                           f"{result.peak_memory_mb:7.0f} MB", flush=True)
-            # Hugging Face models contain reference cycles, so the old model is only
-            # freed after garbage collection. Without this, each model stays in GPU
-            # memory, inflating later memory numbers and eventually spilling to RAM.
             del model, tokenizer
-            gc.collect()
-            if device == "cuda":
-                torch.cuda.empty_cache()
-                print(f"  GPU memory still allocated after unloading: {torch.cuda.memory_allocated() / 2**20:.0f} MB", flush=True)
+            _release_gpu_memory(device)
 
     if rows:
         print(f"\nSaved {len(rows)} results to {output} and {output.with_suffix('.json')}")
@@ -101,6 +111,94 @@ def cmd_profile(args):
     for op in report.top_ops:
         print(f"  {op['op']:45} {op['category']:12} {op['device_ms']:8.2f} ms  {op['calls']:>5} calls")
     print(f"\nTrace saved to {trace_path} (open it at https://ui.perfetto.dev)")
+
+def cmd_optimize(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Eager mode always runs first: every variant is compared with it in the same session,
+    # because GPU clocks on laptops vary from run to run
+    variants = ["eager"] + [v for v in args.variants if v != "eager"]
+    rows = []
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata = _metadata(warmup=args.warmup, iters=args.iters, seed=args.seed, variants=variants)
+
+    for size in args.models:
+        print(f"\nLoading ESM-2 {size} ({args.dtype}) on {device}...", flush=True)
+        model, tokenizer = load_model(size, args.dtype, device)
+        for seq_len in args.seq_lens:
+            for batch_size in args.batch_sizes:
+                sequences = synthetic_sequences(batch_size, seq_len, seed=args.seed)
+                inputs = tokenizer(sequences, return_tensors="pt", padding=True).to(device)
+                with torch.inference_mode():
+                    reference = model(**inputs).last_hidden_state.clone()
+                print(f"  batch {batch_size} x len {seq_len}:", flush=True)
+                eager_latency = None
+
+                for name in variants:
+                    # Start every compiled variant from a clean slate, so each shape gets its own compiled graph
+                    torch._dynamo.reset()
+                    try:
+                        variant = build_variant(model, name)
+                        start = time.perf_counter()
+                        with torch.inference_mode():
+                            output_tensor = variant(**inputs).last_hidden_state.clone()
+                        if device == "cuda":
+                            torch.cuda.synchronize()
+                        first_call_s = time.perf_counter() - start
+                        result = benchmark_inference(variant, tokenizer, sequences, size, args.dtype, device,
+                                                     warmup=args.warmup, iters=args.iters)
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        print(f"    {name:20} out of GPU memory", flush=True)
+                        continue
+                    except RuntimeError as e:
+                        if "No available kernel" not in str(e):
+                            raise
+                        print(f"    {name:20} not available on this GPU/build", flush=True)
+                        continue
+
+                    if name == "eager":
+                        eager_latency = result.latency_ms
+                    row = {**result.to_dict(), "variant": name, "first_call_s": first_call_s,
+                           "speedup_vs_eager": eager_latency / result.latency_ms if eager_latency else None,
+                           **output_difference(reference, output_tensor)}
+                    rows.append(row)
+                    _save_results(output, rows, metadata)
+                    speedup = f"{row['speedup_vs_eager']:.2f}x" if row["speedup_vs_eager"] else "-"
+                    print(f"    {name:20} {result.latency_ms:9.2f} ms  {speedup:>6}  first call {first_call_s:6.1f} s  "
+                          f"max diff {row['max_abs_diff']:.4f}", flush=True)
+                    del variant
+        torch._dynamo.reset()
+        del model, tokenizer
+        _release_gpu_memory(device)
+
+    print(f"\nSaved {len(rows)} results to {output} and {output.with_suffix('.json')}")
+
+def cmd_batching(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sequences = read_fasta(args.fasta)[:args.limit]
+    lengths = [len(s) for s in sequences]
+    print(f"{len(sequences)} proteins from {args.fasta}: lengths {min(lengths)}-{max(lengths)}, "
+          f"median {sorted(lengths)[len(lengths) // 2]}")
+    model, tokenizer = load_model(args.model, args.dtype, device)
+
+    rows = []
+    for strategy in STRATEGIES:
+        result = run_dataset(model, tokenizer, sequences, strategy, args.batch_size, args.max_tokens, device)
+        rows.append(result.to_dict())
+        print(f"  {strategy:13} {result.total_s:7.2f} s  {result.sequences_per_s:7.1f} seq/s  "
+              f"{result.batches:4} batches  padding efficiency {result.padding_efficiency:5.1%}  "
+              f"{result.peak_memory_mb:6.0f} MB", flush=True)
+
+    baseline = rows[0]["total_s"]
+    for row in rows:
+        row["speedup_vs_unsorted"] = baseline / row["total_s"]
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata = _metadata(model=args.model, dtype=args.dtype, fasta=args.fasta, sequences=len(sequences),
+                         batch_size=args.batch_size, max_tokens=args.max_tokens)
+    _save_results(output, rows, metadata)
+    print(f"\nSaved results to {output} and {output.with_suffix('.json')}")
 
 def cmd_report(args):
     data = load_results(args.input)
@@ -140,6 +238,28 @@ def main(argv=None):
     prof.add_argument("--iters", type=int, default=5)
     prof.add_argument("--seed", type=int, default=0)
     prof.set_defaults(func=cmd_profile)
+
+    opt = commands.add_parser("optimize", help="Compare framework-level optimizations with eager mode")
+    opt.add_argument("--models", type=_str_list, default=["150M"], help=f"Comma-separated: {','.join(ESM2_MODELS)}")
+    opt.add_argument("--dtype", default="fp16", choices=list(DTYPES))
+    opt.add_argument("--variants", type=_str_list, default=list(VARIANTS), help=f"Comma-separated: {','.join(VARIANTS)}")
+    opt.add_argument("--batch-sizes", type=_int_list, default=[1, 8, 32])
+    opt.add_argument("--seq-lens", type=_int_list, default=[256, 512])
+    opt.add_argument("--warmup", type=int, default=5)
+    opt.add_argument("--iters", type=int, default=10)
+    opt.add_argument("--seed", type=int, default=0)
+    opt.add_argument("--output", default=str(RESULTS_DIR / "optimizations.csv"))
+    opt.set_defaults(func=cmd_optimize)
+
+    bat = commands.add_parser("batching", help="Compare batching strategies on real proteins of different lengths")
+    bat.add_argument("--fasta", default="data/uniprot_human_sample.fasta")
+    bat.add_argument("--limit", type=int, default=1000, help="Use only the first N proteins")
+    bat.add_argument("--model", default="150M", choices=list(ESM2_MODELS))
+    bat.add_argument("--dtype", default="fp16", choices=list(DTYPES))
+    bat.add_argument("--batch-size", type=int, default=8)
+    bat.add_argument("--max-tokens", type=int, default=4096, help="Token budget per batch for the token-budget strategy")
+    bat.add_argument("--output", default=str(RESULTS_DIR / "batching.csv"))
+    bat.set_defaults(func=cmd_batching)
 
     rep = commands.add_parser("report", help="Charts and a summary table from benchmark results")
     rep.add_argument("--input", default=str(RESULTS_DIR / "baseline.json"))
