@@ -32,8 +32,10 @@ def cmd_info(args):
 
 def _save_results(output: Path, rows: list, metadata: dict):
     """Write results as CSV and as JSON with metadata"""
+    # Rows can have different fields (e.g. GB/s for some kernels, TFLOPS for others)
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with output.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
     output.with_suffix(".json").write_text(json.dumps({"metadata": metadata, "results": rows}, indent=2))
