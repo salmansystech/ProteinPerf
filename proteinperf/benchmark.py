@@ -5,6 +5,10 @@ import statistics
 import time
 import torch
 
+# Reserved memory above this fraction of the GPU's total memory leaves no room for
+# the CUDA context and the display, so the run has likely spilled into system RAM
+SPILL_THRESHOLD = 0.9
+
 @dataclass
 class BenchmarkResult:
     model: str
@@ -17,6 +21,10 @@ class BenchmarkResult:
     tokens_per_s: float
     peak_memory_mb: float
     device: str
+    peak_reserved_mb: float = 0.0
+    # On Windows the NVIDIA driver can spill into system RAM instead of failing
+    # when GPU memory runs out, which makes timings meaningless
+    exceeds_gpu_memory: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,7 +76,13 @@ def benchmark_inference(model: torch.nn.Module, tokenizer, sequences: List[str],
 
     times = time_function(forward, device, warmup, iters)
     latency = statistics.median(times)
-    peak_memory = torch.cuda.max_memory_allocated() / 2**20 if device.startswith("cuda") else 0.0
+    peak_memory = peak_reserved = 0.0
+    exceeds = False
+    if device.startswith("cuda"):
+        peak_memory = torch.cuda.max_memory_allocated() / 2**20
+        peak_reserved = torch.cuda.max_memory_reserved() / 2**20
+        total = torch.cuda.get_device_properties(device).total_memory / 2**20
+        exceeds = peak_reserved > SPILL_THRESHOLD * total
 
     return BenchmarkResult(
         model=model_name,
@@ -81,4 +95,6 @@ def benchmark_inference(model: torch.nn.Module, tokenizer, sequences: List[str],
         tokens_per_s=batch_size * tokens_per_sequence / (latency / 1000),
         peak_memory_mb=peak_memory,
         device=device,
+        peak_reserved_mb=peak_reserved,
+        exceeds_gpu_memory=exceeds,
     )

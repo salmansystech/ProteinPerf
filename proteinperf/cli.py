@@ -60,6 +60,8 @@ def cmd_benchmark(args):
                         print(f"  batch {batch_size:>3} x len {seq_len:>4}: out of GPU memory", flush=True)
                         continue
                     rows.append(result.to_dict())
+                    if result.exceeds_gpu_memory:
+                        print(f"  batch {batch_size:>3} x len {seq_len:>4}: exceeded GPU memory, timing not valid", flush=True)
                     # Save after every result so a long run can be stopped without losing data
                     _save_results(output, rows, metadata)
                     print(f"  batch {batch_size:>3} x len {seq_len:>4}: {result.latency_ms:8.2f} ms  "

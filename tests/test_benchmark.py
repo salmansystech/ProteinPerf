@@ -33,4 +33,5 @@ def test_benchmark_inference(tiny_model, tokenizer):
     # Every sequence also gets a <cls> and an <eos> token
     assert result.tokens_per_s == pytest.approx(4 * 32 / (result.latency_ms / 1000))
     assert result.peak_memory_mb == 0
+    assert result.exceeds_gpu_memory is False
     assert set(result.to_dict()) >= {"model", "latency_ms", "tokens_per_s", "peak_memory_mb"}
