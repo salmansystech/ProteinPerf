@@ -167,6 +167,22 @@ python -m proteinperf batching --model 150M --dtype fp16 --limit 1000 --batch-si
 
 Embeds the first `--limit` proteins of `data/uniprot_human_sample.fasta` (or `--fasta your.fasta`) with each batching strategy and reports total time, throughput and padding efficiency.
 
+### Kernels (phase 4)
+
+```bash
+python -m proteinperf kernels --models 150M,650M --batch-size 8 --seq-len 512
+```
+
+Microbenchmarks each Triton kernel at the layer shapes of the given models against the eager PyTorch code it replaces and `torch.compile` of that code, with the maximum difference from PyTorch and the achieved bandwidth (as a percentage of a measured device-to-device copy) or TFLOPS. Results go to `results/kernels.csv` and `.json`.
+
+To measure the kernels inside the whole model, use the Triton variants of `optimize`:
+
+```bash
+python -m proteinperf optimize --models 150M --variants sdpa-efficient,triton-rotary,triton-gelu,triton-ffn,triton,compile
+```
+
+The first call of each kernel at a new shape includes Triton's JIT compilation and, for the matmul, autotuning. Both are cached on disk, so later runs start faster.
+
 ### Report
 
 ```bash
@@ -231,6 +247,15 @@ Add a row to `OP_CATEGORIES` in `proteinperf/profiling.py`: a name, a tuple of e
 1. Write a `cmd_<name>(args)` function in `proteinperf/cli.py`.
 2. Register it in `main()` with `commands.add_parser(...)` and `set_defaults(func=cmd_<name>)`.
 3. Put the actual logic in a module, not in `cli.py`, and test that module.
+
+### Add a Triton kernel
+
+1. Write the kernel and a Python wrapper in `proteinperf/kernels/`, with a PyTorch reference implementation of the same operation next to it.
+2. Add correctness tests to `tests/test_kernels.py` against the reference: several shapes (including sizes that aren't multiples of the block size), dtypes and non-contiguous inputs.
+3. Add a microbenchmark to `benchmark_kernels()` in `kernels/bench.py`.
+4. To use it in the model, swap the matching Hugging Face function in `esm_triton_kernels()` (`kernels/patch.py`), restoring it in the `finally` block, and add a variant to `TRITON_VARIANTS` in `variants.py`.
+
+Triton kernels must be defined in a `.py` file (Triton reads their source), and their tests must skip when CUDA isn't available so CI keeps passing.
 
 ### Benchmark a new model variant
 
