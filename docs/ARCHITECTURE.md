@@ -15,7 +15,9 @@ This document explains how ProteinPerf is built and, just as importantly, how it
 9. [Design decisions](#9-design-decisions)
 10. [Framework-level optimizations (phase 3)](#10-framework-level-optimizations-phase-3)
 11. [Custom Triton kernels (phase 4)](#11-custom-triton-kernels-phase-4)
-12. [Planned architecture](#12-planned-architecture)
+12. [Roofline analysis (phase 2)](#12-roofline-analysis-phase-2)
+13. [Profiling assistant (phase 5)](#13-profiling-assistant-phase-5)
+14. [Future work](#14-future-work)
 
 ---
 
@@ -78,11 +80,14 @@ Models are loaded once per model and precision, then reused for every sequence l
 | `sequences.py` | Benchmark inputs | `synthetic_sequences()`, `read_fasta()` |
 | `benchmark.py` | Timing, throughput and memory | `time_function()`, `benchmark_inference()`, `percentile()` |
 | `profiling.py` | Operator-level breakdown | `profile_inference()`, `summarize()`, `categorize()` |
-| `report.py` | Charts and tables | `speedups()`, `markdown_table()`, `plot_results()` |
+| `report.py` | Charts and tables | `speedups()`, `markdown_table()`, `plot_results()`, `plot_roofline()`, `utilization_table()` |
 | `environment.py` | Reproducibility metadata | `environment_info()` |
 | `variants.py` | Framework-level optimizations (phase 3) | `build_variant()`, `output_difference()`, `VARIANTS` |
 | `batching.py` | Batching strategies for mixed-length proteins (phase 3) | `make_batches()`, `padding_stats()`, `run_dataset()` |
 | `kernels/` | Custom Triton kernels, model patching and microbenchmarks (phase 4) | `rotary_embedding()`, `gelu()`, `linear()`, `esm_triton_kernels()`, `benchmark_kernels()` |
+| `roofline.py` | FLOPs, bytes and roofline efficiency of each layer operation (phase 2) | `layer_ops()`, `model_flops()`, `measure_layer()`, `measured_peak_tflops()` |
+| `findings.py` | Rule-based conclusions from all results (phase 5) | `collect_findings()`, `parse_profile()` |
+| `assistant.py` | Profiling assistant: LLM agent with read-only tools (phase 5) | `ask()`, `ResultsTools`, `ollama_chat()` |
 | `cli.py` | Argument parsing and orchestration | `main()` and one `cmd_*` function per command |
 
 ```mermaid
@@ -97,9 +102,14 @@ flowchart TD
     cli --> batching[batching.py]
     cli --> kernels[kernels/]
     variants --> kernels
+    cli --> roofline[roofline.py]
+    roofline --> kernels
+    cli --> assistant[assistant.py]
+    assistant --> findings[findings.py]
+    findings --> report
 ```
 
-The measurement modules (`benchmark.py`, `profiling.py`) take any PyTorch model and any callable tokenizer. They don't depend on `models.py`, which is what lets the tests run them with a tiny model, and will let later phases measure compiled models and custom kernels with the same code.
+The measurement modules (`benchmark.py`, `profiling.py`) take any PyTorch model and any callable tokenizer. They don't depend on `models.py`, which is what lets the tests run them with a tiny model, and lets phases 3 and 4 measure compiled models and models with custom kernels with the same code.
 
 ---
 
@@ -407,20 +417,103 @@ Hugging Face's `EsmSelfAttention.forward` calls the module-level function `apply
 
 ---
 
-## 12. Planned architecture
+## 12. Roofline analysis (phase 2)
 
-Later phases plug into the same measurement pipeline:
+The profiler (section 6) says where time goes. The roofline says how much of that time is necessary. `roofline.py` combines an analytical model of the work with measured hardware limits and measured operation times.
 
 ```mermaid
 flowchart LR
-    Base["Baseline<br/>Hugging Face ESM-2"] --> M["Same benchmark<br/>and profiler"]
-    Compiled["torch.compile<br/>(Inductor)"] --> M
-    Kernels["Model with<br/>Triton kernels"] --> M
-    M --> R["Side-by-side results"]
-    R --> Agent["Profiling assistant<br/>(LLM)"]
+    Spec["ModelSpec<br/>layers, hidden size, heads"] --> Ops["layer_ops()<br/>FLOPs and bytes per operation"]
+    Ops --> AI["Arithmetic intensity<br/>FLOPs / byte"]
+    Peak["measured_peak_tflops()<br/>4096³ FP16 matmul"] --> Roof["Roofline<br/>min(peak, intensity × bandwidth)"]
+    BW["measured_bandwidth_gbs()<br/>512 MB copy"] --> Roof
+    AI --> Roof
+    Time["measure_layer()<br/>each operation timed with do_bench"] --> Eff["Efficiency<br/>achieved / attainable"]
+    Roof --> Eff
 ```
 
-| Phase | New modules (planned) |
+### The work model (`layer_ops`)
+
+For batch `b`, `n = b × (length + 2)` token rows, hidden size `h` and feed-forward size `4h`, one layer is 11 operations:
+
+| Operation | FLOPs | Minimum bytes moved |
+|---|---|---|
+| LayerNorm (×2) | ≈ 8nh | read and write the activations |
+| q, k, v projection | 2n·h·3h | input, weights, bias, output |
+| Rotary embedding | 3 per element of q and k | read and write q and k |
+| Attention | 4·b·tokens²·h | read q, k, v, write the output (fused, as the efficient and flash kernels are, so the tokens × tokens scores never reach memory) |
+| Output projection | 2n·h·h | input, weights, bias, output |
+| Residual add (×2) | nh | two inputs, one output |
+| Feed-forward up and down | 2n·h·4h each | input, weights, bias, output |
+| GELU | ≈ 8 per element | read and write the activation |
+
+Bytes are the minimum: each input read once and each output written once. A real implementation that makes several passes over memory, such as Hugging Face's rotary code, can't reach that bound, which is exactly what the efficiency number exposes. The model's total FLOPs are within a few percent of the transformer rule of thumb of 2 FLOPs per weight per token plus attention, and a test checks this.
+
+### Hardware limits
+
+Peaks are measured, not taken from a datasheet, because a laptop GPU's clocks depend on its power and cooling limits:
+
+- **Compute peak:** a 4096 × 4096 × 4096 matmul in the chosen precision with cuBLAS.
+- **Bandwidth:** a 512 MB device-to-device copy (the same measurement as phase 4).
+- **Ridge point:** peak / bandwidth, about 85 FLOPs per byte on the RTX 3070 Laptop GPU. Operations below it are memory-bound, operations above it compute-bound.
+
+### Measurement
+
+`measure_layer()` builds tensors with the model's real shapes and times each operation as eager PyTorch runs it (`F.linear`, `F.layer_norm`, `F.scaled_dot_product_attention`, and Hugging Face's own rotary and GELU code), using `triton.testing.do_bench`, which flushes the L2 cache between runs. For each operation it records the measured time, the roofline time `max(FLOPs / peak, bytes / bandwidth)`, the achieved TFLOPS and GB/s, and the efficiency.
+
+The `roofline` command also times the whole model at the same shape. Comparing it with the layer count × (sum of measured operations) shows how much time falls outside the modeled operations, for example copies, masking and launch gaps.
+
+### Model FLOPs utilization
+
+`utilization_table()` in `report.py` divides `model_flops()` by each FP16 latency from the phase 1 baseline, giving whole-model TFLOPS and its share of the measured peak for every model, batch size and length, without running anything new.
+
+---
+
+## 13. Profiling assistant (phase 5)
+
+The assistant answers questions about the results. It is split so that the part that must be right is deterministic and tested, and the language model only reads and explains.
+
+```mermaid
+flowchart LR
+    Q["Question"] --> Agent["assistant.ask()<br/>tool-calling loop"]
+    Agent <--> LLM["Ollama chat API<br/>local or cloud"]
+    Agent <--> Tools["ResultsTools<br/>read-only"]
+    Tools --> Files["results/*.json<br/>results/profiles/*.txt"]
+    Tools --> Findings["findings.py<br/>rule-based conclusions"]
+    Findings --> Files
+    Agent --> A["Answer with<br/>measured numbers"]
+```
+
+### Rule-based findings (`findings.py`)
+
+One rule function per results file turns rows into sentences, reusing `report.py` (`speedups`, `valid_rows`, `noisy_shapes`) so the conclusions match the tables:
+
+| Rule | Finding |
 |---|---|
-| 2. Compute and memory analysis | `roofline.py`: FLOPs and bytes per layer from the model configuration, arithmetic intensity, and roofline charts against the GPU's peak compute and bandwidth |
-| 5. Profiling assistant | An agent that reads profile reports and explains bottlenecks in plain language |
+| Baseline | Half-precision speed-up range per model; results that spilled out of GPU memory |
+| Profiles | Largest category; elementwise + memory share above 25% suggests fusion |
+| Roofline | Operations taking ≥10% of a layer at <50% of their roofline; whole model vs roofline |
+| Optimizations, kernel variants | Best variant per shape, or a warning when the noise control deviates by more than 10% |
+| Batching | Speed-up, padding efficiency and memory of each strategy |
+| Kernels | Speed-up over eager and `torch.compile`, and bandwidth or TFLOPS reached |
+
+`ask --no-llm` prints these directly.
+
+### The agent (`assistant.py`)
+
+- **Tools:** `list_results`, `get_findings`, `read_results(name, model)` and `read_profile(name)`. They are read-only. File names are checked against a fixed list, and profile names are reduced to a bare file name, so the model can't read outside `results/`. Results are rounded and capped at 60 rows per call to keep the context small.
+- **Loop:** the question goes to the model with the tool definitions. While it returns tool calls, `ask()` runs them and sends the results back as `tool` messages, for at most 8 rounds. Each call is printed, so the user sees what the answer is based on.
+- **Grounding:** the system prompt tells the model to read before answering, quote measured numbers with their model, precision and shape, mention noisy or missing results, and never invent measurements.
+- **Provider:** Ollama's `/api/chat` with Python's standard library (`urllib`), so no extra dependency. `OLLAMA_BASE_URL`, `OLLAMA_MODEL` and `OLLAMA_API_KEY` come from the environment or a git-ignored `.env` file. A local Ollama model costs nothing; Ollama Cloud needs only a key.
+- **Testing:** the chat function is a parameter of `ask()`, so tests replay scripted model replies (tool calls, then an answer) and check the messages sent, without a network.
+
+---
+
+## 14. Future work
+
+| Area | Idea |
+|---|---|
+| Combined optimizations | Register the Triton kernels as custom ops so `torch.compile` can keep them inside its graphs, combining both speed-ups |
+| Attention | A Triton attention kernel tuned for ESM-2's small heads (32 dimensions in 150M), where the efficient kernel reaches 38% of its roofline |
+| AMD GPUs | Run the same benchmarks and Triton kernels on ROCm |
+| Scale | Multi-GPU throughput and the 3B and 15B models |
