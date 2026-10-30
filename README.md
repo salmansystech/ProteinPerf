@@ -4,7 +4,7 @@
 
 **Profiling and optimizing protein language model inference on GPUs.**
 
-ProteinPerf measures where the time goes when running [ESM-2](https://github.com/facebookresearch/esm), Meta's family of protein language models, and then makes it faster, step by step: from careful baselines and operator-level profiling, through roofline analysis and framework-level optimization (`torch.compile`, mixed precision, attention kernels), to custom GPU kernels written in Triton.
+ProteinPerf measures where the time goes when running [ESM-2](https://github.com/facebookresearch/esm), Meta's family of protein language models, and then makes it faster, step by step: from careful baselines and operator-level profiling, through roofline analysis and framework-level optimization (`torch.compile`, mixed precision, attention kernels), to custom GPU kernels written in Triton. A profiling assistant then answers questions about the results in plain language.
 
 Every optimization is measured against the same baseline on the same hardware, with the results, charts and methodology in this repository.
 
@@ -25,6 +25,7 @@ Protein language models like ESM-2 are used across drug discovery and biology to
 | **Roofline analysis** | FLOPs and bytes of every layer operation, measured against the GPU's measured compute peak and memory bandwidth, plus whole-model FLOPs utilization |
 | **Optimization** | `torch.compile`, CUDA graphs, attention backends and length-aware batching, each checked for accuracy against eager mode |
 | **Custom GPU kernels** | Triton kernels for rotary embeddings, GELU and a matmul with fused bias + GELU, tested against PyTorch and benchmarked against PyTorch, `torch.compile` and cuBLAS |
+| **Profiling assistant** | Ask questions about the results in plain English: an LLM (free local Ollama model or Ollama Cloud) reads the results through tools and answers with the measured numbers. Rule-based findings work without any model |
 | **Reporting** | Throughput, speed-up, memory and roofline charts, plus Markdown summary tables |
 | **Reproducibility** | Every result records the GPU, driver, CUDA, PyTorch and Transformers versions and the benchmark settings |
 | **Realistic inputs** | Synthetic proteins with natural amino acid composition (UniProtKB/Swiss-Prot), or your own FASTA file |
@@ -75,9 +76,15 @@ python -m proteinperf kernels --models 150M,650M
 
 # Charts and summary tables from the results
 python -m proteinperf report --input results/benchmark.json
+
+# Ask the profiling assistant (needs Ollama, see below), or print the rule-based findings
+python -m proteinperf ask "Why is the 150M model slower than the roofline?"
+python -m proteinperf ask --no-llm
 ```
 
 Model weights download automatically from Hugging Face the first time each model is used (31 MB for 8M, up to 2.6 GB for 650M).
+
+The profiling assistant (`ask`) needs [Ollama](https://ollama.com). Either run it locally for free and pull a model that supports tool calling, or use Ollama Cloud: copy `.env.example` to `.env` and set `OLLAMA_BASE_URL=https://ollama.com` and `OLLAMA_API_KEY`. The `.env` file is ignored by git. `ask --no-llm` works without Ollama.
 
 Full setup instructions, including WSL2 for the Triton work, are in the [Developer Guide](docs/DEVELOPER_GUIDE.md).
 
@@ -93,6 +100,7 @@ Full setup instructions, including WSL2 for the Triton work, are in the [Develop
 | `roofline` | Measures the GPU's compute peak and bandwidth, then times each layer operation and places it on the roofline | `--models`, `--dtype`, `--batch-size`, `--seq-len` |
 | `kernels` | Microbenchmarks the custom Triton kernels against PyTorch eager and `torch.compile` | `--models`, `--dtype`, `--batch-size`, `--seq-len` |
 | `report` | Charts and Markdown tables for all results | `--input`, `--optimizations`, `--batching`, `--kernels`, `--kernel-variants`, `--roofline`, `--output-dir` |
+| `ask` | Answers a question about the results with the profiling assistant | `question`, `--no-llm`, `--results-dir` |
 
 Run `python -m proteinperf <command> --help` for every option.
 
@@ -323,6 +331,27 @@ The eager matmul is cuBLAS, so the matmul rows compare the Triton kernel directl
 6. **Accuracy holds.** The GELU and feed-forward kernels compute GELU in FP32, where Hugging Face computes it in FP16, so their embeddings differ by FP16 rounding (lowest cosine similarity 0.996, mean difference at most 0.003), similar to `torch.compile`.
 7. **One result doesn't fit.** For 150M at batch 8 × 256, the GELU and feed-forward kernels made the model 0.76–0.86× as fast, although in isolation both kernels are faster at that exact shape (fused matmul + GELU 1.90×). The noise control also ran 9% slow there, just inside the 10% threshold, so this is most likely noise, but it hasn't been confirmed with a re-run.
 
+### Profiling assistant (phase 5)
+
+The results are spread across six files and three profile reports. The assistant answers questions about them in plain English. It has two layers:
+
+1. **Rule-based findings** (`findings.py`) read every results file and state the main conclusions with fixed rules: speed-ups, operations far below their roofline, fusion opportunities, and shapes too noisy to trust. They need no language model: `python -m proteinperf ask --no-llm`.
+2. **An LLM agent** (`assistant.py`) gets the question and four read-only tools: list the results, get the findings, read the rows of a results file (optionally for one model), and read a profile. It decides what to read, then answers from those results only, quoting the measured numbers. It uses Ollama's API, so it runs with a free local model or with Ollama Cloud.
+
+```
+$ python -m proteinperf ask "For ESM-2 650M at batch 32 and length 512, how much faster is the triton variant than eager and than torch.compile, and how much peak memory does eager use?"
+  [reading get_findings ]
+  [reading read_results {"model": "650M", "name": "kernel_variants.json"}]
+  [reading read_results {"model": "650M", "name": "baseline.json"}]
+
+For ESM-2 650M (FP16) at batch 32 and length 512:
+
+*   **Speedups:** The `triton` variant is **1.27x** faster than `eager` and **1.03x** faster than `torch.compile`
+    (calculated from latencies: triton 1658.78ms, compile 1704.68ms, eager 2110.23ms).
+*   **Peak Memory:** The `eager` variant uses **2131.84 MB** of peak memory.
+```
+
+All three numbers match `results/kernel_variants.json`. This answer came from `gemma4:31b` on Ollama Cloud in about 5 seconds. Language models can still make mistakes, so the tool calls are printed and the raw results stay one command away.
 <!-- RESULTS:END -->
 
 ## Project structure
@@ -339,6 +368,8 @@ ProteinPerf/
 │   ├── batching.py       # Batching strategies for mixed-length proteins
 │   ├── roofline.py       # FLOPs, bytes and roofline efficiency of each layer operation
 │   ├── kernels/          # Custom Triton kernels: rotary, GELU, matmul with fused epilogue
+│   ├── findings.py       # Rule-based conclusions from all results
+│   ├── assistant.py      # Profiling assistant: LLM agent with read-only tools over the results
 │   ├── report.py         # Charts and summary tables
 │   └── environment.py    # Hardware and software details for each result
 ├── data/                 # 2,000 real human proteins from UniProtKB/Swiss-Prot
@@ -353,6 +384,7 @@ ProteinPerf/
 ├── docs/
 │   ├── ARCHITECTURE.md   # How the system works and how it measures
 │   └── DEVELOPER_GUIDE.md
+├── .env.example          # Ollama settings for the profiling assistant
 └── .github/workflows/    # CI
 ```
 
@@ -364,7 +396,7 @@ ProteinPerf/
 | 2. Compute and memory analysis | ✅ Done | FLOPs and bytes per layer operation, arithmetic intensity, roofline chart, model FLOPs utilization |
 | 3. Framework-level optimization | ✅ Done | `torch.compile` (Inductor), CUDA graphs, attention backends, length-sorted and token-budget batching |
 | 4. Custom Triton kernels | ✅ Done | Fused rotary embedding, fused GELU, and a tiled matmul with fused bias + GELU, compared with PyTorch, `torch.compile` and cuBLAS |
-| 5. Profiling assistant | Planned | An LLM agent that explains profiler results and suggests optimizations |
+| 5. Profiling assistant | ✅ Done | Rule-based findings plus an LLM agent (Ollama) that reads the results through tools and answers questions |
 | Future | | Combining the Triton kernels with `torch.compile`, a faster attention kernel for small heads, AMD GPUs (ROCm), multi-GPU scaling, protein structure models |
 
 The kernels are written in [Triton](https://github.com/triton-lang/triton), which compiles for both NVIDIA (CUDA) and AMD (ROCm) GPUs. They have only been tested on NVIDIA so far.
