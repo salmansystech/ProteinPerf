@@ -1,8 +1,9 @@
 """Roofline analysis: how close each ESM-2 operation gets to the GPU's compute and memory limits"""
 from dataclasses import dataclass, asdict
-from typing import List
+from typing import Callable, Dict, List
+import torch
 
-from proteinperf.models import ModelSpec
+from proteinperf.models import ESM2_MODELS, ModelSpec
 
 @dataclass
 class LayerOp:
@@ -68,3 +69,76 @@ def ridge_point(peak_tflops: float, bandwidth_gbs: float) -> float:
 def roofline_time_ms(op: LayerOp, peak_tflops: float, bandwidth_gbs: float) -> float:
     """Shortest possible time for an operation on this GPU"""
     return max(op.flops / (peak_tflops * 1e12), op.bytes / (bandwidth_gbs * 1e9)) * 1000
+
+def measured_peak_tflops(dtype: torch.dtype = torch.float16, size: int = 4096) -> float:
+    """Practical compute peak: a large square matrix multiply with cuBLAS"""
+    from triton.testing import do_bench
+
+    a = torch.randn(size, size, device="cuda", dtype=dtype)
+    b = torch.randn(size, size, device="cuda", dtype=dtype)
+    ms = do_bench(lambda: a @ b, warmup=25, rep=200, return_mode="median")
+    return 2 * size ** 3 / (ms / 1000) / 1e12
+
+def _op_functions(spec: ModelSpec, batch_size: int, seq_len: int, dtype: torch.dtype) -> Dict[str, Callable]:
+    """Each layer operation as PyTorch runs it in eager mode, on tensors of the model's shapes"""
+    import torch.nn.functional as F
+    from proteinperf.kernels.gelu import gelu_reference
+    from proteinperf.kernels.rotary import rotary_embedding_reference
+
+    tokens = seq_len + 2
+    h, i, heads = spec.hidden_size, spec.intermediate_size, spec.heads
+    device = "cuda"
+
+    def randn(*shape):
+        return torch.randn(*shape, device=device, dtype=dtype)
+
+    x, residual = randn(batch_size, tokens, h), randn(batch_size, tokens, h)
+    up = randn(batch_size, tokens, i)
+    norm_weight, norm_bias = randn(h), randn(h)
+    w_qkv, b_qkv = randn(3 * h, h) / h ** 0.5, randn(3 * h)
+    w_out, b_out = randn(h, h) / h ** 0.5, randn(h)
+    w_up, b_up = randn(i, h) / h ** 0.5, randn(i)
+    w_down, b_down = randn(h, i) / i ** 0.5, randn(h)
+    q, k, v = (randn(batch_size, tokens, h).view(batch_size, tokens, heads, -1).transpose(1, 2) for _ in range(3))
+    angles = torch.randn(batch_size, tokens, spec.head_dim // 2, device=device)
+    cos = torch.cat([angles.cos()] * 2, dim=-1).to(dtype)
+    sin = torch.cat([angles.sin()] * 2, dim=-1).to(dtype)
+
+    layernorm = lambda: F.layer_norm(x, (h,), norm_weight, norm_bias)
+    return {
+        "layernorm (attention)": layernorm,
+        "q, k, v projection": lambda: F.linear(x, w_qkv, b_qkv),
+        "rotary embedding": lambda: rotary_embedding_reference(q, k, cos, sin),
+        "attention": lambda: F.scaled_dot_product_attention(q, k, v),
+        "output projection": lambda: F.linear(x, w_out, b_out),
+        "residual add (attention)": lambda: x + residual,
+        "layernorm (feed-forward)": layernorm,
+        "feed-forward up": lambda: F.linear(x, w_up, b_up),
+        "gelu": lambda: gelu_reference(up),
+        "feed-forward down": lambda: F.linear(up, w_down, b_down),
+        "residual add (feed-forward)": lambda: x + residual,
+    }
+
+def measure_layer(size: str, batch_size: int, seq_len: int, dtype: torch.dtype,
+                  peak_tflops: float, bandwidth_gbs: float) -> List[dict]:
+    """Time each layer operation and place it on the roofline"""
+    from triton.testing import do_bench
+
+    spec = ESM2_MODELS[size]
+    functions = _op_functions(spec, batch_size, seq_len, dtype)
+    rows = []
+    for op in layer_ops(spec, batch_size, seq_len, torch.finfo(dtype).bits // 8):
+        ms = do_bench(functions[op.name], warmup=25, rep=100, return_mode="median")
+        achieved = op.flops / (ms / 1000) / 1e12
+        attainable = attainable_tflops(op.intensity, peak_tflops, bandwidth_gbs)
+        rows.append({
+            "model": size, "batch_size": batch_size, "seq_len": seq_len, **op.to_dict(),
+            "bound": "compute" if op.intensity >= ridge_point(peak_tflops, bandwidth_gbs) else "memory",
+            "measured_ms": ms,
+            "roofline_ms": roofline_time_ms(op, peak_tflops, bandwidth_gbs),
+            "achieved_tflops": achieved,
+            "achieved_gbs": op.bytes / (ms / 1000) / 1e9,
+            "attainable_tflops": attainable,
+            "efficiency": achieved / attainable,
+        })
+    return rows
