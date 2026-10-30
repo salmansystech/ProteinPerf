@@ -13,3 +13,6 @@ results/traces/
 .vscode/
 .idea/
 .DS_Store
+
+# Secrets (Ollama API key)
+.env
