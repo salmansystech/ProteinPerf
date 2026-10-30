@@ -262,6 +262,48 @@ def cmd_kernels(args):
                                           measured_bandwidth_gbs=bandwidth))
     print(f"\nSaved results to {output} and {output.with_suffix('.json')}")
 
+def cmd_roofline(args):
+    from proteinperf.kernels.bench import measured_bandwidth_gbs
+    from proteinperf.roofline import measure_layer, measured_peak_tflops, ridge_point
+
+    dtype = DTYPES[args.dtype]
+    bandwidth = measured_bandwidth_gbs()
+    peak = measured_peak_tflops(dtype)
+    print(f"Measured copy bandwidth {bandwidth:.0f} GB/s, {args.dtype.upper()} matmul peak {peak:.1f} TFLOPS, "
+          f"ridge point {ridge_point(peak, bandwidth):.0f} FLOPs/byte", flush=True)
+
+    rows, models = [], []
+    for size in args.models:
+        layer = measure_layer(size, args.batch_size, args.seq_len, dtype, peak, bandwidth)
+        rows.extend(layer)
+        print(f"\nESM-2 {size}, one layer, batch {args.batch_size} x length {args.seq_len}:")
+        for r in layer:
+            print(f"  {r['name']:28} {r['intensity']:7.1f} FLOPs/byte  {r['bound']:7}  {r['measured_ms']:7.3f} ms  "
+                  f"roofline {r['roofline_ms']:7.3f} ms  efficiency {r['efficiency']:4.0%}", flush=True)
+
+        # The whole model, to see how much time the per-operation model doesn't account for
+        model, tokenizer = load_model(size, args.dtype, "cuda")
+        sequences = synthetic_sequences(args.batch_size, args.seq_len, seed=0)
+        whole = benchmark_inference(model, tokenizer, sequences, size, args.dtype, "cuda", warmup=5, iters=10)
+        layers = ESM2_MODELS[size].layers
+        summary = {
+            "model": size, "layers": layers,
+            "whole_model_ms": whole.latency_ms,
+            "sum_of_operations_ms": layers * sum(r["measured_ms"] for r in layer),
+            "roofline_ms": layers * sum(r["roofline_ms"] for r in layer),
+        }
+        models.append(summary)
+        print(f"  whole model {summary['whole_model_ms']:.1f} ms, sum of operations {summary['sum_of_operations_ms']:.1f} ms, "
+              f"roofline {summary['roofline_ms']:.1f} ms", flush=True)
+        del model, tokenizer
+        _release_gpu_memory("cuda")
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _save_results(output, rows, _metadata(dtype=args.dtype, batch_size=args.batch_size, seq_len=args.seq_len,
+                                          measured_bandwidth_gbs=bandwidth, measured_peak_tflops=peak, models=models))
+    print(f"\nSaved results to {output} and {output.with_suffix('.json')}")
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="proteinperf", description="Benchmark and profile ESM-2 protein language models")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -317,6 +359,14 @@ def main(argv=None):
     ker.add_argument("--seq-len", type=int, default=512)
     ker.add_argument("--output", default=str(RESULTS_DIR / "kernels.csv"))
     ker.set_defaults(func=cmd_kernels)
+
+    roof = commands.add_parser("roofline", help="Place each layer operation on the GPU's roofline")
+    roof.add_argument("--models", type=_str_list, default=["150M", "650M"], help=f"Comma-separated: {','.join(ESM2_MODELS)}")
+    roof.add_argument("--dtype", default="fp16", choices=list(DTYPES))
+    roof.add_argument("--batch-size", type=int, default=8)
+    roof.add_argument("--seq-len", type=int, default=512)
+    roof.add_argument("--output", default=str(RESULTS_DIR / "roofline.csv"))
+    roof.set_defaults(func=cmd_roofline)
 
     rep = commands.add_parser("report", help="Charts and a summary table from benchmark results")
     rep.add_argument("--input", default=str(RESULTS_DIR / "baseline.json"))
