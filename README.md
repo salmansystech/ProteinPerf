@@ -4,7 +4,7 @@
 
 **Profiling and optimizing protein language model inference on GPUs.**
 
-ProteinPerf measures where the time goes when running [ESM-2](https://github.com/facebookresearch/esm), Meta's family of protein language models, and then makes it faster, step by step: from careful baselines and operator-level profiling, through framework-level optimization (`torch.compile`, mixed precision, attention kernels), to custom GPU kernels written in Triton.
+ProteinPerf measures where the time goes when running [ESM-2](https://github.com/facebookresearch/esm), Meta's family of protein language models, and then makes it faster, step by step: from careful baselines and operator-level profiling, through roofline analysis and framework-level optimization (`torch.compile`, mixed precision, attention kernels), to custom GPU kernels written in Triton.
 
 Every optimization is measured against the same baseline on the same hardware, with the results, charts and methodology in this repository.
 
@@ -22,9 +22,10 @@ Protein language models like ESM-2 are used across drug discovery and biology to
 |---|---|
 | **Benchmarking** | GPU timing with CUDA events, warm-up runs, median and p90 latency, throughput in sequences and tokens per second, peak GPU memory, and out-of-memory handling |
 | **Profiling** | PyTorch Profiler breakdown by operator category, the slowest operators, and a full trace you can open in Perfetto |
+| **Roofline analysis** | FLOPs and bytes of every layer operation, measured against the GPU's measured compute peak and memory bandwidth, plus whole-model FLOPs utilization |
 | **Optimization** | `torch.compile`, CUDA graphs, attention backends and length-aware batching, each checked for accuracy against eager mode |
 | **Custom GPU kernels** | Triton kernels for rotary embeddings, GELU and a matmul with fused bias + GELU, tested against PyTorch and benchmarked against PyTorch, `torch.compile` and cuBLAS |
-| **Reporting** | Throughput, speed-up and memory charts, plus Markdown summary tables |
+| **Reporting** | Throughput, speed-up, memory and roofline charts, plus Markdown summary tables |
 | **Reproducibility** | Every result records the GPU, driver, CUDA, PyTorch and Transformers versions and the benchmark settings |
 | **Realistic inputs** | Synthetic proteins with natural amino acid composition (UniProtKB/Swiss-Prot), or your own FASTA file |
 | **Tested** | Unit tests with a tiny in-memory ESM model, so CI runs without a GPU or downloads |
@@ -66,6 +67,9 @@ python -m proteinperf optimize --models 150M --dtype fp16
 # Compare batching strategies on 1,000 real proteins
 python -m proteinperf batching --model 150M --dtype fp16
 
+# How close each layer operation gets to the GPU's compute and memory limits
+python -m proteinperf roofline --models 150M,650M
+
 # Microbenchmark the custom Triton kernels
 python -m proteinperf kernels --models 150M,650M
 
@@ -86,8 +90,9 @@ Full setup instructions, including WSL2 for the Triton work, are in the [Develop
 | `profile` | GPU time by operator category and the slowest operators, plus a trace file | `--model`, `--dtype`, `--batch-size`, `--seq-len`, `--iters` |
 | `optimize` | Compares `torch.compile`, CUDA graphs and attention backends with eager mode, including accuracy | `--models`, `--dtype`, `--variants`, `--batch-sizes`, `--seq-lens` |
 | `batching` | Compares batching strategies on real proteins of different lengths | `--fasta`, `--limit`, `--model`, `--dtype`, `--batch-size`, `--max-tokens` |
+| `roofline` | Measures the GPU's compute peak and bandwidth, then times each layer operation and places it on the roofline | `--models`, `--dtype`, `--batch-size`, `--seq-len` |
 | `kernels` | Microbenchmarks the custom Triton kernels against PyTorch eager and `torch.compile` | `--models`, `--dtype`, `--batch-size`, `--seq-len` |
-| `report` | Charts and Markdown tables for all results | `--input`, `--optimizations`, `--batching`, `--kernels`, `--kernel-variants`, `--output-dir` |
+| `report` | Charts and Markdown tables for all results | `--input`, `--optimizations`, `--batching`, `--kernels`, `--kernel-variants`, `--roofline`, `--output-dir` |
 
 Run `python -m proteinperf <command> --help` for every option.
 
@@ -145,6 +150,58 @@ Measured on an **NVIDIA GeForce RTX 3070 Laptop GPU** (8 GB, Ampere, compute cap
 6. **Longer sequences cost more per token.** ESM-2 650M in FP16 drops from 10,800 tokens/s at length 128 to about 7,500 at lengths 512–1000, as attention cost grows with the square of the length.
 
 **About the hardware:** under sustained load, this laptop's GPU ran at about 800–1,700 MHz, below its 2,100 MHz maximum, because of the laptop's power and cooling limits. The numbers reflect this real-world laptop, not a desktop RTX 3070.
+
+### Compute and memory analysis (phase 2)
+
+A roofline model says how fast each operation *could* run. An operation is limited either by compute or by memory bandwidth, depending on its **arithmetic intensity** (FLOPs per byte moved). ProteinPerf counts the FLOPs and minimum bytes of every operation in an ESM-2 layer from the model's dimensions. It measures this GPU's real limits: **30.3 TFLOPS** for an FP16 matmul and **357 GB/s** for a large memory copy. Then it times each operation in eager PyTorch at the model's shapes.
+
+`python -m proteinperf roofline --models 150M,650M` (FP16, batch 8 × length 512):
+
+![Roofline of one ESM-2 layer](results/charts/roofline.png)
+
+ESM-2 650M, one layer:
+
+| Operation | FLOPs/byte | Limited by | Measured | Roofline | Share of layer | Efficiency |
+|---|---|---|---|---|---|---|
+| layernorm (attention) | 2.0 | memory | 0.077 ms | 0.059 ms | 1% | 77% |
+| q, k, v projection | 778.2 | compute | 1.443 ms | 1.335 ms | 14% | 93% |
+| rotary embedding | 0.8 | memory | 1.839 ms | 0.118 ms | 18% | **6%** |
+| attention | 257.0 | compute | 0.625 ms | 0.357 ms | 6% | 57% |
+| output projection | 553.7 | compute | 0.553 ms | 0.445 ms | 5% | 80% |
+| residual add (attention) | 0.2 | memory | 0.093 ms | 0.088 ms | 1% | 95% |
+| layernorm (feed-forward) | 2.0 | memory | 0.070 ms | 0.059 ms | 1% | 85% |
+| feed-forward up | 819.7 | compute | 2.047 ms | 1.780 ms | 20% | 87% |
+| gelu | 2.0 | memory | 1.317 ms | 0.236 ms | 13% | **18%** |
+| feed-forward down | 819.8 | compute | 2.095 ms | 1.780 ms | 20% | 85% |
+| residual add (feed-forward) | 0.2 | memory | 0.094 ms | 0.088 ms | 1% | 94% |
+
+Whole model:
+
+| Model | Measured | Sum of operations | Roofline | Measured / roofline |
+|---|---|---|---|---|
+| ESM-2 150M | 130.9 ms | 119.9 ms | 55.1 ms | 2.4× |
+| ESM-2 650M | 396.8 ms | 338.3 ms | 209.4 ms | 1.9× |
+
+Model FLOPs utilization: whole-model TFLOPS from the phase 1 FP16 baseline, as a share of the 30.3 TFLOPS peak:
+
+| Model | Batch | Length 128 | Length 256 | Length 512 | Length 1000 |
+|---|---|---|---|---|---|
+| ESM-2 8M | 1 | 0.3 (1%) | 0.7 (2%) | 1.6 (5%) | 3.4 (11%) |
+| ESM-2 8M | 32 | 5.8 (19%) | 6.4 (21%) | 6.4 (21%) | 6.5 (22%) |
+| ESM-2 150M | 1 | 1.5 (5%) | 1.4 (5%) | 3.1 (10%) | 6.4 (21%) |
+| ESM-2 150M | 32 | 8.0 (26%) | 7.8 (26%) | 7.6 (25%) | 7.9 (26%) |
+| ESM-2 650M | 1 | 4.5 (15%) | 6.4 (21%) | 7.7 (26%) | 9.7 (32%) |
+| ESM-2 650M | 8 | 14.2 (47%) | 11.6 (38%) | 10.1 (33%) | 11.1 (37%) |
+
+`python -m proteinperf report` prints the full tables for every model and batch size.
+
+### Phase 2 findings
+
+1. **The matrix multiplies are close to the limit.** All four matmuls in a layer are compute-bound and reach 79–93% of the measured peak. There is little left to gain in them on this GPU.
+2. **Two small operations waste the most time.** Rotary embedding and GELU do almost no math (0.8 and 2 FLOPs per byte), so they should cost about as long as reading and writing their data. Instead they run at 6% and 16–18% of that limit and take **31% of each layer in 650M and 44% in 150M**. Running both at the roofline would cut layer time by up to 27% (650M) and 40% (150M). The cause is most likely Hugging Face's implementation, which makes several passes over memory per operation (FP32 casts, slices and concatenations in rotary; separate divide, `erf`, add and multiply kernels in GELU). The roofline confirms, with a different method, the targets chosen from the phase 1 profile; the phase 4 kernels run them at 91–98% of bandwidth.
+3. **Attention reaches about half its limit.** The memory-efficient attention kernel reaches 57% of the compute roofline in 650M (64-dimension heads) but only 38% in 150M (32-dimension heads). Smaller heads most likely give each tile of the kernel less work. FlashAttention, which might do better, isn't available in PyTorch's Windows build.
+4. **The whole model runs at 1.9–2.4× the roofline lower bound.** The operations modeled here account for 85–92% of the measured time. The rest is work outside them, such as the extra copies found in phase 1, the attention mask and the embeddings, and gaps between kernel launches.
+5. **Small batches leave the GPU mostly idle.** At batch 1 the smaller models use 1–21% of the compute peak, because launch overhead dominates (as phase 1 found). The 650M model at batch 8 reaches 33–47%, the best on this GPU without optimization.
 
 ### Framework-level optimizations (phase 3)
 
@@ -265,6 +322,7 @@ The eager matmul is cuBLAS, so the matmul rows compare the Triton kernel directl
 5. **At small batches, `torch.compile` wins.** At batch 1 it's 2.0–3.2× faster than eager, against 1.2–1.3× for the custom kernels. Compiling fuses every small operation in the model and cuts launch overhead, while the custom kernels only replace the rotary and feed-forward operations. The two approaches are complementary.
 6. **Accuracy holds.** The GELU and feed-forward kernels compute GELU in FP32, where Hugging Face computes it in FP16, so their embeddings differ by FP16 rounding (lowest cosine similarity 0.996, mean difference at most 0.003), similar to `torch.compile`.
 7. **One result doesn't fit.** For 150M at batch 8 × 256, the GELU and feed-forward kernels made the model 0.76–0.86× as fast, although in isolation both kernels are faster at that exact shape (fused matmul + GELU 1.90×). The noise control also ran 9% slow there, just inside the 10% threshold, so this is most likely noise, but it hasn't been confirmed with a re-run.
+
 <!-- RESULTS:END -->
 
 ## Project structure
@@ -279,6 +337,7 @@ ProteinPerf/
 │   ├── profiling.py      # PyTorch Profiler breakdown by operator category
 │   ├── variants.py       # torch.compile, CUDA graphs and attention backend variants
 │   ├── batching.py       # Batching strategies for mixed-length proteins
+│   ├── roofline.py       # FLOPs, bytes and roofline efficiency of each layer operation
 │   ├── kernels/          # Custom Triton kernels: rotary, GELU, matmul with fused epilogue
 │   ├── report.py         # Charts and summary tables
 │   └── environment.py    # Hardware and software details for each result
@@ -287,8 +346,9 @@ ProteinPerf/
 ├── results/
 │   ├── baseline.csv/.json # Raw benchmark data with environment metadata
 │   ├── optimizations.csv/.json, batching.csv/.json  # Phase 3 results
+│   ├── roofline.csv/.json # Phase 2 results
 │   ├── kernels.csv/.json, kernel_variants.csv/.json # Phase 4 results
-│   ├── charts/           # Throughput, speed-up and memory charts
+│   ├── charts/           # Throughput, speed-up, memory, optimization, kernel and roofline charts
 │   └── profiles/         # GPU time breakdowns per configuration
 ├── docs/
 │   ├── ARCHITECTURE.md   # How the system works and how it measures
@@ -301,11 +361,11 @@ ProteinPerf/
 | Phase | Status | Focus |
 |---|---|---|
 | 1. Baseline and profiling | ✅ Done | Benchmarks across models, precisions, batch sizes and lengths; operator-level profiling |
-| 2. Compute and memory analysis | Planned | FLOPs and bytes per layer, arithmetic intensity, roofline charts |
+| 2. Compute and memory analysis | ✅ Done | FLOPs and bytes per layer operation, arithmetic intensity, roofline chart, model FLOPs utilization |
 | 3. Framework-level optimization | ✅ Done | `torch.compile` (Inductor), CUDA graphs, attention backends, length-sorted and token-budget batching |
 | 4. Custom Triton kernels | ✅ Done | Fused rotary embedding, fused GELU, and a tiled matmul with fused bias + GELU, compared with PyTorch, `torch.compile` and cuBLAS |
 | 5. Profiling assistant | Planned | An LLM agent that explains profiler results and suggests optimizations |
-| Future | | AMD GPUs (ROCm), multi-GPU scaling, protein structure models |
+| Future | | Combining the Triton kernels with `torch.compile`, a faster attention kernel for small heads, AMD GPUs (ROCm), multi-GPU scaling, protein structure models |
 
 The kernels are written in [Triton](https://github.com/triton-lang/triton), which compiles for both NVIDIA (CUDA) and AMD (ROCm) GPUs. They have only been tested on NVIDIA so far.
 
