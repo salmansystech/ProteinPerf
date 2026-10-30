@@ -23,6 +23,8 @@ This document explains how ProteinPerf is built and, just as importantly, how it
 
 ## 1. System overview
 
+ProteinPerf is a pipeline in four stages: **inputs** (models and proteins), **model variants** (the same ESM-2 model run in different ways), **measurement** (one set of timing, profiling and roofline code for every variant) and **analysis** (results files, then charts, tables, findings and the assistant). Every stage communicates through files in `results/`, so analysis never depends on in-memory state and can be re-run without a GPU.
+
 ```mermaid
 flowchart LR
     CLI["CLI<br/>python -m proteinperf"]
@@ -32,43 +34,81 @@ flowchart LR
         Models["models.py<br/>ESM-2 from Hugging Face"]
     end
 
+    subgraph Variants["Model variants"]
+        Eager["Eager PyTorch<br/>(baseline)"]
+        Var["variants.py<br/>torch.compile · CUDA graphs<br/>attention backends"]
+        Kern["kernels/<br/>Triton rotary · GELU · matmul"]
+    end
+
     subgraph Measurement
         Bench["benchmark.py<br/>latency · throughput · memory"]
         Prof["profiling.py<br/>time by operator category"]
+        Batch["batching.py<br/>real mixed-length proteins"]
+        Roof["roofline.py<br/>FLOPs · bytes · efficiency"]
+        KBench["kernels/bench.py<br/>kernel microbenchmarks"]
     end
 
     Env["environment.py<br/>GPU · CUDA · versions"]
-    Report["report.py<br/>charts · tables"]
 
-    subgraph Outputs["results/"]
-        CSV[("benchmark .csv / .json")]
-        Trace[("traces/*.json")]
-        Charts[("charts/*.png")]
+    subgraph Results["results/"]
+        Data[("*.csv / *.json<br/>with metadata")]
+        Profiles[("profiles/*.txt<br/>traces/*.json")]
     end
 
-    CLI --> Seq
-    CLI --> Models
-    Seq --> Bench
-    Models --> Bench
-    Seq --> Prof
-    Models --> Prof
-    Bench --> CSV
-    Env --> CSV
-    Prof --> Trace
-    CSV --> Report
-    Report --> Charts
+    subgraph Analysis
+        Report["report.py<br/>charts · tables"]
+        Find["findings.py<br/>rule-based conclusions"]
+        Agent["assistant.py<br/>LLM agent (Ollama)"]
+    end
+
+    Charts[("charts/*.png")]
+    User(["Answers in<br/>plain English"])
+
+    CLI --> Seq & Models
+    Models --> Eager & Var & Kern
+    Seq --> Bench & Prof & Batch
+    Eager & Var & Kern --> Bench
+    Eager --> Prof & Batch
+    Kern --> KBench
+    Kern --> Roof
+    Env --> Data
+    Bench & Batch & Roof & KBench --> Data
+    Prof --> Profiles
+    Data --> Report --> Charts
+    Data & Profiles --> Find
+    Find --> Agent
+    Data & Profiles --> Agent
+    Agent --> User
 ```
 
-There are four commands, each a thin layer over the modules:
+There are nine commands, each a thin layer over the modules:
 
-| Command | Flow |
-|---|---|
-| `info` | `environment.py` → console |
-| `benchmark` | for each model and precision: `models.py` → for each length and batch size: `sequences.py` → `benchmark.py` → CSV + JSON with environment metadata |
-| `profile` | `models.py` + `sequences.py` → `profiling.py` → category breakdown + Perfetto trace |
-| `report` | results JSON → `report.py` → PNG charts + Markdown table |
+| Command | Phase | Flow |
+|---|---|---|
+| `info` | | `environment.py` → console |
+| `benchmark` | 1 | for each model and precision: `models.py` → for each length and batch size: `sequences.py` → `benchmark.py` → CSV + JSON with environment metadata |
+| `profile` | 1 | `models.py` + `sequences.py` → `profiling.py` → category breakdown + Perfetto trace |
+| `roofline` | 2 | measure peak TFLOPS and bandwidth → `roofline.py` times each layer operation → whole model with `benchmark.py` → `roofline.csv/.json` |
+| `optimize` | 3, 4 | `models.py` → eager reference → each variant from `variants.py` (including the Triton variants) → `benchmark.py` + accuracy check → CSV + JSON |
+| `batching` | 3 | FASTA → `batching.py` strategies → total time, padding efficiency, memory → CSV + JSON |
+| `kernels` | 4 | measured bandwidth → `kernels/bench.py` times each kernel against eager and `torch.compile` → CSV + JSON |
+| `report` | all | every results JSON that exists → `report.py` → PNG charts + Markdown tables |
+| `ask` | 5 | question → `assistant.py` tool-calling loop over `results/` (or `findings.py` alone with `--no-llm`) → answer |
 
-Models are loaded once per model and precision, then reused for every sequence length and batch size, because loading weights is far slower than any measurement.
+Models are loaded once per model and precision, then reused for every sequence length, batch size and variant, because loading weights is far slower than any measurement.
+
+### How the phases build on each other
+
+```mermaid
+flowchart LR
+    P1["Phase 1<br/>Baseline + profile<br/>where does time go?"] --> P2["Phase 2<br/>Roofline<br/>how much is necessary?"]
+    P1 --> P3["Phase 3<br/>Framework optimizations<br/>compile · graphs · batching"]
+    P2 --> P4["Phase 4<br/>Triton kernels<br/>rotary · GELU · matmul"]
+    P3 --> P4
+    P1 & P2 & P3 & P4 --> P5["Phase 5<br/>Profiling assistant<br/>explains all results"]
+```
+
+Phase 1's profile showed elementwise operations growing to 29% of FP16 time; phase 2's roofline showed rotary embedding and GELU running at 6–18% of their limit; phase 4 replaced exactly those operations. Phase 3's `optimize` command and noise control are reused unchanged to measure the phase 4 kernels inside the model.
 
 ---
 
@@ -252,20 +292,37 @@ The full trace is saved to `results/traces/` and can be opened at [ui.perfetto.d
 
 ## 7. Results and reporting
 
-`benchmark` writes two files:
+Every measuring command writes two files:
 
-- **CSV:** one row per configuration, easy to open in a spreadsheet or pandas.
-- **JSON:** the same rows plus metadata (timestamp, GPU, compute capability, CUDA, PyTorch and Transformers versions, warm-up and iteration counts, and seed).
+- **CSV:** one row per configuration, easy to open in a spreadsheet or pandas. Columns are the union of all rows' fields, since some rows have extra fields (for example GB/s for memory-bound kernels, TFLOPS for matmuls).
+- **JSON:** the same rows plus metadata (timestamp, GPU, compute capability, CUDA, PyTorch and Transformers versions, and the command's settings, such as warm-up and iteration counts, seed, or the measured peaks for the roofline).
 
-`report` reads the JSON and produces:
+Results are saved after every configuration, so a long run can be stopped without losing data.
+
+| File | Written by | One row per |
+|---|---|---|
+| `baseline.csv/.json` | `benchmark` | model × precision × batch size × length |
+| `profiles/*.txt` | `profile` (saved from its output) | configuration, as a text report |
+| `roofline.csv/.json` | `roofline` | model × layer operation |
+| `optimizations.csv/.json` | `optimize` | model × shape × variant |
+| `batching.csv/.json` | `batching` | batching strategy |
+| `kernels.csv/.json` | `kernels` | model × kernel |
+| `kernel_variants.csv/.json` | `optimize` with the Triton variants | model × shape × variant |
+
+`report` reads every JSON file that exists and produces:
 
 | Chart | Shows |
 |---|---|
 | `throughput.png` | Tokens per second vs sequence length, one panel per model, one line per precision |
 | `speedup.png` | Average speed-up of FP16 and BF16 over FP32 per model |
 | `memory.png` | Peak memory vs sequence length for the largest model |
+| `roofline.png` | Every layer operation on a log-log roofline against the measured peak and bandwidth |
+| `optimizations.png` | Speed-up of each framework-level variant over eager, per shape, with noisy shapes labeled |
+| `kernels.png` | Whole-model speed-up of the Triton kernel variants and `torch.compile` |
 
-It also prints a Markdown table of sequences per second and peak memory, ready for the README.
+It also prints Markdown tables for each, ready for the README: throughput and memory, roofline efficiency per operation, whole model vs roofline, model FLOPs utilization, speed-ups per variant (⚠ on noisy shapes), batching strategies and kernel microbenchmarks.
+
+Results that spilled out of GPU memory (`exceeds_gpu_memory`) are excluded from every chart, table and finding by `valid_rows()`.
 
 ---
 
@@ -276,14 +333,17 @@ It also prints a Markdown table of sequences per second and peak memory, ready f
 | `test_sequences.py` | Lengths, alphabet, reproducibility, natural composition, FASTA parsing |
 | `test_benchmark.py` | Percentiles, warm-up and iteration counts, throughput and token arithmetic |
 | `test_profiling.py` | Operator categorization, kernel and bookkeeping events excluded, older PyTorch attribute names, a real profile run |
-| `test_report.py` | Speed-up calculation, Markdown table (including OOM cells), chart files |
+| `test_report.py` | Speed-up calculation, Markdown tables (including OOM cells and noise markers), chart files |
+| `test_roofline.py` | FLOPs formulas, attention growing with length², total FLOPs vs the 2-FLOPs-per-weight rule, compute- vs memory-bound classification, roofline bounds, roofline and utilization tables |
 | `test_variants.py` | Variant construction, attention backend wrapper, output comparison |
 | `test_batching.py` | Every strategy covers each sequence once, sorting, token budgets, padding statistics, a dataset run |
 | `test_kernels.py` | Each Triton kernel against PyTorch on the GPU (skipped without CUDA) |
 | `test_patch.py` | Kernels are swapped in and always restored, variant construction |
-| `test_cli.py` | Argument validation |
+| `test_findings.py` | Profile parsing, each finding rule, spilled results and noisy shapes excluded |
+| `test_assistant.py` | Tools (listing, filtering, rounding, staying inside `results/`, bad arguments), the tool-calling loop with a scripted model, the round limit, `.env` loading |
+| `test_cli.py` | Argument validation, saving mixed-field rows, `ask --no-llm`, unreachable Ollama |
 
-- **No GPU and no downloads:** `conftest.py` builds a 2-layer ESM model with random weights and a minimal tokenizer, so the real benchmark and profiler code runs on CPU in seconds.
+- **No GPU, no downloads and no network:** `conftest.py` builds a 2-layer ESM model with random weights and a minimal tokenizer, so the real benchmark and profiler code runs on CPU in seconds. The assistant's tests replace the language model with a scripted fake.
 - **CI:** GitHub Actions installs the CPU build of PyTorch and runs the suite on Python 3.11 and 3.13 for every push and pull request.
 - GPU results themselves are validated by cross-checking: the profiler total against benchmark latency, and token throughput against sequences per second.
 
@@ -301,6 +361,11 @@ It also prints a Markdown table of sequences per second and peak memory, ready f
 | **Environment saved with every result** | Performance depends on GPU, driver and library versions; results without them can't be compared or reproduced. |
 | **A tiny model for tests** | Tests exercise the real code paths without needing a GPU or network access. |
 | **Triton for custom kernels** | Python-level GPU kernels that compile for both NVIDIA and AMD GPUs. |
+| **Eager mode measured first, in the same session** | Laptop GPU clocks vary between runs, so every variant is compared with an eager run made minutes earlier, not with an old baseline. |
+| **A noise control variant** | `sdpa-efficient` runs the same kernels as eager, so its deviation from 1.0× measures noise. Shapes off by more than 10% are flagged and left out of conclusions. |
+| **Measured hardware limits for the roofline** | A laptop GPU never reaches its datasheet clocks under sustained load. Peaks measured on the same machine give an honest ceiling. |
+| **Rules first, language model second** | Conclusions that must be right come from tested code (`findings.py`). The LLM only reads and explains, through read-only tools, and every tool call is shown. |
+| **Ollama through the standard library** | Free local models or Ollama Cloud, no paid subscription and no extra dependency. The API key stays in a git-ignored `.env`. |
 
 ---
 
