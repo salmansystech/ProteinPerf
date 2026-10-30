@@ -321,6 +321,23 @@ def cmd_roofline(args):
                                           measured_bandwidth_gbs=bandwidth, measured_peak_tflops=peak, models=models))
     print(f"\nSaved results to {output} and {output.with_suffix('.json')}")
 
+def cmd_ask(args):
+    from proteinperf.assistant import AssistantError, ask, load_env
+    from proteinperf.findings import collect_findings
+
+    if args.no_llm:
+        for finding in collect_findings(args.results_dir):
+            print(f"- {finding}")
+        return
+
+    load_env()
+    try:
+        answer = ask(args.question, args.results_dir,
+                     on_tool_call=lambda name, arguments: print(f"  [reading {name} {json.dumps(arguments) if arguments else ''}]", flush=True))
+    except AssistantError as e:
+        raise SystemExit(f"{e}\nRun with --no-llm to see the rule-based findings without a language model.")
+    print(f"\n{answer}")
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="proteinperf", description="Benchmark and profile ESM-2 protein language models")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -384,6 +401,12 @@ def main(argv=None):
     roof.add_argument("--seq-len", type=int, default=512)
     roof.add_argument("--output", default=str(RESULTS_DIR / "roofline.csv"))
     roof.set_defaults(func=cmd_roofline)
+
+    ask_cmd = commands.add_parser("ask", help="Ask the profiling assistant about the results")
+    ask_cmd.add_argument("question", nargs="?", default="Where does the time go, and what should I optimize next?")
+    ask_cmd.add_argument("--results-dir", default=str(RESULTS_DIR))
+    ask_cmd.add_argument("--no-llm", action="store_true", help="Only print the rule-based findings")
+    ask_cmd.set_defaults(func=cmd_ask)
 
     rep = commands.add_parser("report", help="Charts and a summary table from benchmark results")
     rep.add_argument("--input", default=str(RESULTS_DIR / "baseline.json"))

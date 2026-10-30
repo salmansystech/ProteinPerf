@@ -28,3 +28,15 @@ def test_save_results_handles_rows_with_different_fields(tmp_path):
     assert list(saved[0]) == ["kernel", "triton_gbs", "triton_tflops"]
     assert saved[1]["triton_tflops"] == "27.5" and saved[1]["triton_gbs"] == ""
     assert json.loads((tmp_path / "out.json").read_text())["results"] == rows
+
+def test_ask_without_llm_prints_findings(tmp_path, capsys):
+    import json
+    rows = [{"strategy": "sorted", "speedup_vs_unsorted": 1.9, "padding_efficiency": 0.99, "batches": 10, "peak_memory_mb": 400.0}]
+    (tmp_path / "batching.json").write_text(json.dumps({"metadata": {}, "results": rows}))
+    main(["ask", "--no-llm", "--results-dir", str(tmp_path)])
+    assert "- Batching strategy sorted: 1.90x over unsorted batches" in capsys.readouterr().out
+
+def test_ask_reports_unreachable_ollama(tmp_path, monkeypatch):
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")    # nothing listens on the discard port
+    with pytest.raises(SystemExit, match="Could not reach Ollama"):
+        main(["ask", "--results-dir", str(tmp_path)])
