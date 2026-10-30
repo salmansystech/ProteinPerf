@@ -14,7 +14,8 @@ from proteinperf.environment import environment_info
 from proteinperf.models import DTYPES, ESM2_MODELS, MAX_SEQUENCE_LENGTH, load_model
 from proteinperf.profiling import profile_inference
 from proteinperf.report import (batching_table, kernel_table, load_results, markdown_table, optimization_table,
-                                plot_optimizations, plot_results, valid_rows)
+                                plot_optimizations, plot_results, plot_roofline, roofline_table, utilization_table,
+                                valid_rows)
 from proteinperf.sequences import read_fasta, synthetic_sequences
 from proteinperf.variants import VARIANTS, build_variant, output_difference
 
@@ -239,6 +240,22 @@ def cmd_report(args):
             print(f"\nESM-2 {model}, whole-model speed-up over eager:\n")
             print(optimization_table(kv_rows, model))
 
+    if Path(args.roofline).exists():
+        roof = load_results(args.roofline)
+        settings = roof["metadata"]["settings"]
+        peak, bandwidth = settings["measured_peak_tflops"], settings["measured_bandwidth_gbs"]
+        print(f"\nSaved {plot_roofline(roof['results'], peak, bandwidth, args.output_dir, title_suffix=gpu)}")
+        for model in dict.fromkeys(r["model"] for r in roof["results"]):
+            print(f"\nESM-2 {model}, one layer, batch {settings['batch_size']} x length {settings['seq_len']}:\n")
+            print(roofline_table(roof["results"], model))
+        print("\nWhole model:\n")
+        print("| Model | Measured | Sum of operations | Roofline | Measured / roofline |\n|---|---|---|---|---|")
+        for m in settings["models"]:
+            print(f"| ESM-2 {m['model']} | {m['whole_model_ms']:.1f} ms | {m['sum_of_operations_ms']:.1f} ms | "
+                  f"{m['roofline_ms']:.1f} ms | {m['whole_model_ms'] / m['roofline_ms']:.1f}× |")
+        print(f"\nFP16 model FLOPs utilization, TFLOPS (share of the {peak:.1f} TFLOPS matmul peak):\n")
+        print(utilization_table(rows, peak))
+
 def cmd_kernels(args):
     from proteinperf.kernels.bench import benchmark_kernels, measured_bandwidth_gbs
 
@@ -377,6 +394,7 @@ def main(argv=None):
     rep.add_argument("--batching", default=str(RESULTS_DIR / "batching.json"), help="Included when the file exists")
     rep.add_argument("--kernels", default=str(RESULTS_DIR / "kernels.json"), help="Included when the file exists")
     rep.add_argument("--kernel-variants", default=str(RESULTS_DIR / "kernel_variants.json"), help="Included when the file exists")
+    rep.add_argument("--roofline", default=str(RESULTS_DIR / "roofline.json"), help="Included when the file exists")
     rep.set_defaults(func=cmd_report)
     
     args = parser.parse_args(argv)

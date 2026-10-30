@@ -3,6 +3,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
+import math
 
 MODEL_ORDER = ["8M", "35M", "150M", "650M", "3B"]
 DTYPE_COLORS = {"fp32": "#64748b", "fp16": "#2563eb", "bf16": "#16a34a"}
@@ -249,4 +250,108 @@ def kernel_table(rows: List[dict]) -> str:
         lines.append(f"| {r['model']} | {KERNEL_NAMES.get(r['kernel'], r['kernel'])} | {r['eager_ms']:.3f} ms | "
                      f"{r['compiled_ms']:.3f} ms | {r['triton_ms']:.3f} ms | {r['speedup_vs_eager']:.2f}× | "
                      f"{r['speedup_vs_compile']:.2f}× | {throughput} | {r['max_abs_diff']:.4f} |")
+    return "\n".join(lines)
+
+def roofline_table(rows: List[dict], model: str) -> str:
+    """Each layer operation: intensity, what limits it, and how close it gets to that limit"""
+    selected = [r for r in rows if r["model"] == model]
+    layer_ms = sum(r["measured_ms"] for r in selected)
+    lines = ["| Operation | FLOPs/byte | Limited by | Measured | Roofline | Share of layer | Efficiency |",
+             "|---|---|---|---|---|---|---|"]
+    for r in selected:
+        lines.append(f"| {r['name']} | {r['intensity']:.1f} | {r['bound']} | {r['measured_ms']:.3f} ms | "
+                     f"{r['roofline_ms']:.3f} ms | {r['measured_ms'] / layer_ms:.0%} | {r['efficiency']:.0%} |")
+    return "\n".join(lines)
+
+# Operation kinds in the roofline chart, in the default categorical order
+KIND_COLORS = {"Matmul": "#2a78d6", "Attention": "#eb6834", "LayerNorm": "#1baf7a", "Elementwise": "#e34948"}
+MODEL_MARKERS = {"8M": "v", "35M": "^", "150M": "o", "650M": "s", "3B": "D"}
+
+def plot_roofline(rows: List[dict], peak_tflops: float, bandwidth_gbs: float, output_dir: str,
+                  title_suffix: Optional[str] = None) -> str:
+    """Log-log roofline chart with every measured layer operation; returns the saved path"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    intensities = [r["intensity"] for r in rows]
+    x = [min(intensities) / 2, max(intensities) * 2]
+    ridge = peak_tflops * 1000 / bandwidth_gbs
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(*x)
+    ax.set_ylim(min(r["achieved_tflops"] for r in rows) / 3, peak_tflops * 3)
+    ax.plot([x[0], ridge, x[1]], [x[0] * bandwidth_gbs / 1000, peak_tflops, peak_tflops], color="#0f172a", linewidth=2)
+    # Rotate the bandwidth label to follow the sloped roof as drawn on screen
+    start, end = ax.transData.transform([(x[0], x[0] * bandwidth_gbs / 1000), (ridge, peak_tflops)])
+    angle = math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
+    label_x = x[0] * 2
+    ax.text(label_x, label_x * bandwidth_gbs / 1000 * 1.6, f"Memory bandwidth {bandwidth_gbs:.0f} GB/s (measured)",
+            rotation=angle, rotation_mode="anchor", fontsize=8, color="#334155")
+    ax.text(ridge / 1.3, peak_tflops * 1.25, f"FP16 matmul peak {peak_tflops:.1f} TFLOPS (measured)",
+            fontsize=8, color="#334155", ha="right")
+
+    models = [m for m in MODEL_ORDER if any(r["model"] == m for r in rows)]
+    for model in models:
+        for kind, color in KIND_COLORS.items():
+            points = [(r["intensity"], r["achieved_tflops"]) for r in rows if r["model"] == model and r["kind"] == kind]
+            if points:
+                ax.scatter(*zip(*points), color=color, marker=MODEL_MARKERS.get(model, "o"), s=55,
+                           edgecolors="white", linewidths=1.5, zorder=3)
+    # Label each operation once, at its point for the largest model; the four matmuls sit together, so they share a label
+    largest = [r for r in rows if r["model"] == models[-1]]
+    for r in largest:
+        if r["kind"] != "Matmul" and "(feed-forward)" not in r["name"]:
+            # Attention sits next to the matmuls, so its label goes on the left
+            left = r["kind"] == "Attention"
+            ax.annotate(r["name"].replace(" (attention)", ""), (r["intensity"], r["achieved_tflops"]),
+                        textcoords="offset points", xytext=(-7 if left else 7, -3), ha="right" if left else "left",
+                        fontsize=7.5, color="#334155")
+    matmuls = [r for r in largest if r["kind"] == "Matmul"]
+    if matmuls:
+        middle = math.sqrt(min(r["intensity"] for r in matmuls) * max(r["intensity"] for r in matmuls))
+        ax.text(middle, peak_tflops * 1.25, "4 matmuls: projections, feed-forward", fontsize=7.5, color="#334155", ha="center")
+
+    handles = [Line2D([], [], marker="o", linestyle="", color=c, label=k) for k, c in KIND_COLORS.items()]
+    handles += [Line2D([], [], marker=MODEL_MARKERS.get(m, "o"), linestyle="", color="#64748b", label=f"ESM-2 {m}")
+                for m in models]
+    ax.legend(handles=handles, fontsize=8, loc="lower right")
+    ax.set_xlabel("Arithmetic intensity (FLOPs per byte)")
+    ax.set_ylabel("Achieved TFLOPS")
+    ax.grid(alpha=0.3, which="both")
+    suffix = f"\n{title_suffix}" if title_suffix else ""
+    ax.set_title(f"Roofline of one ESM-2 layer, FP16, eager PyTorch{suffix}", fontsize=11)
+    fig.tight_layout()
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "roofline.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return str(path)
+
+def utilization_table(rows: List[dict], peak_tflops: float, dtype: str = "fp16") -> str:
+    """Model FLOPs utilization: whole-model TFLOPS from the baseline, as a share of the matmul peak"""
+    from proteinperf.models import ESM2_MODELS
+    from proteinperf.roofline import model_flops
+
+    selected = [r for r in rows if r["dtype"] == dtype and r["model"] in ESM2_MODELS]
+    lengths = sorted({r["seq_len"] for r in selected})
+    batches = sorted({r["batch_size"] for r in selected})
+    index = _index(selected)
+    lines = ["| Model | Batch | " + " | ".join(f"Length {l}" for l in lengths) + " |",
+             "|---|---|" + "---|" * len(lengths)]
+    for model in [m for m in MODEL_ORDER if any(r["model"] == m for r in selected)]:
+        for batch in batches:
+            cells = []
+            for length in lengths:
+                r = index.get((model, dtype, batch, length))
+                if r:
+                    tflops = model_flops(ESM2_MODELS[model], batch, length) / (r["latency_ms"] / 1000) / 1e12
+                    cells.append(f"{tflops:.1f} ({tflops / peak_tflops:.0%})")
+                else:
+                    cells.append("-")
+            lines.append(f"| ESM-2 {model} | {batch} | " + " | ".join(cells) + " |")
     return "\n".join(lines)

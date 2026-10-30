@@ -1,6 +1,7 @@
 import pytest
 
 from proteinperf.models import ESM2_MODELS
+from proteinperf.report import roofline_table, utilization_table
 from proteinperf.roofline import (LayerOp, attainable_tflops, layer_ops, model_flops, ridge_point,
                                   roofline_time_ms)
 
@@ -44,3 +45,22 @@ def test_roofline_bounds():
     assert attainable_tflops(1000, 30, 300) == 30                  # above it: the compute peak
     op = LayerOp("x", "Elementwise", flops=1e9, bytes=3e9)
     assert roofline_time_ms(op, 30, 300) == pytest.approx(10)      # 3 GB at 300 GB/s
+
+def _row(model, name, kind, ms, efficiency):
+    return {"model": model, "name": name, "kind": kind, "intensity": 2.0, "bound": "memory",
+            "measured_ms": ms, "roofline_ms": ms * efficiency, "efficiency": efficiency, "achieved_tflops": 0.1}
+
+def test_roofline_table_shares_add_up():
+    rows = [_row("150M", "gelu", "Elementwise", 3.0, 0.2), _row("150M", "layernorm", "LayerNorm", 1.0, 0.8),
+            _row("650M", "gelu", "Elementwise", 9.0, 0.2)]
+    table = roofline_table(rows, "150M")
+    assert "| gelu | 2.0 | memory | 3.000 ms | 0.600 ms | 75% | 20% |" in table
+    assert "9.000" not in table
+
+def test_utilization_table():
+    spec = ESM2_MODELS["8M"]
+    latency_ms = model_flops(spec, 8, 128) / 10e12 * 1000          # exactly 10 TFLOPS
+    rows = [{"model": "8M", "dtype": "fp16", "batch_size": 8, "seq_len": 128, "latency_ms": latency_ms},
+            {"model": "8M", "dtype": "fp32", "batch_size": 8, "seq_len": 128, "latency_ms": 1.0}]
+    table = utilization_table(rows, peak_tflops=20)
+    assert "| ESM-2 8M | 8 | 10.0 (50%) |" in table
