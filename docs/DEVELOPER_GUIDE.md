@@ -27,6 +27,7 @@ Everything you need to set up ProteinPerf, run it, get reliable numbers, and ext
 | NVIDIA driver | Supporting CUDA 12.8 | 596.x |
 | Disk | About 10 GB (PyTorch with CUDA is about 5 GB, models up to 2.6 GB each) | |
 | OS | Windows 10/11, Linux, or WSL2 | Windows 11 |
+| Profiling assistant (optional) | Ollama, local or Ollama Cloud, with a tool-calling model | Ollama Cloud, `gemma4:31b` |
 
 The tests run on any machine with no GPU.
 
@@ -183,13 +184,36 @@ python -m proteinperf optimize --models 150M --variants sdpa-efficient,triton-ro
 
 The first call of each kernel at a new shape includes Triton's JIT compilation and, for the matmul, autotuning. Both are cached on disk, so later runs start faster.
 
+### Roofline (phase 2)
+
+```bash
+python -m proteinperf roofline --models 150M,650M --dtype fp16 --batch-size 8 --seq-len 512
+```
+
+Measures the GPU's compute peak (a large matmul in the chosen precision) and memory bandwidth (a large copy), then times each operation of one layer at the model's shapes and the whole model. Needs a CUDA GPU and Triton (for `do_bench`). Takes a few minutes. Results go to `results/roofline.csv` and `.json`, with the measured peaks and whole-model times in the JSON metadata.
+
+### Ask (phase 5)
+
+```bash
+python -m proteinperf ask "Which operation should I optimize next for the 650M model?"
+python -m proteinperf ask                 # default question: where does the time go?
+python -m proteinperf ask --no-llm        # rule-based findings only, no language model
+```
+
+The assistant reads whatever is in `results/` (or `--results-dir`), so run the other commands first. It needs an Ollama model that supports tool calling:
+
+- **Local (free):** install [Ollama](https://ollama.com/download), run `ollama pull <model>`, and set `OLLAMA_MODEL=<model>`. The default URL `http://localhost:11434` needs no key. Large models need more GPU memory than benchmarking leaves free, so don't run both at once.
+- **Ollama Cloud:** create a key at ollama.com, then copy `.env.example` to `.env` and set `OLLAMA_BASE_URL=https://ollama.com`, `OLLAMA_MODEL` and `OLLAMA_API_KEY`.
+
+`.env` is listed in `.gitignore`. Never commit it. Variables already set in the environment take priority over `.env`.
+
 ### Report
 
 ```bash
 python -m proteinperf report --input results/baseline.json --batch-size 8 --seq-len 512
 ```
 
-Saves `throughput.png`, `speedup.png` and `memory.png` to `results/charts/` and prints a Markdown table.
+Saves `throughput.png`, `speedup.png` and `memory.png` to `results/charts/` and prints a Markdown table. When the phase 2–4 result files exist, it also saves `optimizations.png`, `kernels.png` and `roofline.png` and prints their tables, including model FLOPs utilization.
 
 ---
 
@@ -257,6 +281,12 @@ Add a row to `OP_CATEGORIES` in `proteinperf/profiling.py`: a name, a tuple of e
 
 Triton kernels must be defined in a `.py` file (Triton reads their source), and their tests must skip when CUDA isn't available so CI keeps passing.
 
+### Add a finding or an assistant tool
+
+- **Finding:** write a function in `proteinperf/findings.py` that takes a results path and returns a list of sentences, and register it in `RULES` under the results file name. Reuse `report.py` helpers so findings match the tables. Test it in `tests/test_findings.py` with small JSON files in `tmp_path`.
+- **Results file for the assistant:** add it to `DESCRIPTIONS` in `assistant.py`. `read_results` only opens files listed there.
+- **Tool:** add its schema to `TOOLS` and a method to `ResultsTools`, registered in `call()`. Keep tools read-only and restricted to the results directory. Test with the scripted `FakeModel` in `tests/test_assistant.py`.
+
 ### Benchmark a new model variant
 
 `benchmark_inference()` and `profile_inference()` accept any `torch.nn.Module` whose forward takes the tokenizer's output, for example a compiled model:
@@ -298,6 +328,9 @@ GPU benchmarks are run manually on real hardware, and their results are committe
 | `ESM-2 supports sequences up to 1022 residues` | ESM-2 has 1026 positions, including the CLS and EOS tokens. Use lengths up to 1022. |
 | Model download is slow or fails | Weights come from Hugging Face. Retry, or set `HF_HOME` to a drive with more space. Downloaded models are cached and reused. |
 | Very different numbers between runs | See [Getting reliable benchmark numbers](#7-getting-reliable-benchmark-numbers): check power mode, charger and background apps. |
+| `Could not reach Ollama at http://localhost:11434` | Start Ollama (`ollama serve`) or set `OLLAMA_BASE_URL` in `.env`. `ask --no-llm` works without it. |
+| `Ollama rejected the API key` | Check `OLLAMA_API_KEY` in `.env`, and that an older value isn't already set in your shell environment. |
+| `Ollama API error (400): ... does not support tools` | Choose a model with tool calling (the model's page on ollama.com lists "tools"). |
 | `UserWarning: Profiler clears events at the end of each cycle` | Harmless. The profiler reports on the passes inside the profiling block, which is what ProteinPerf uses. |
 | `exceeded GPU memory, timing not valid` | The configuration needed more memory than the GPU has, and Windows spilled into system RAM. The result is saved with `exceeds_gpu_memory: true` and left out of charts. Use a smaller batch or length, or FP16. Closing other apps that use GPU memory also helps. |
 | `GPU memory still allocated after unloading` is far above 0 MB | Something still references the previous model. Check for references kept in lists, closures or exception tracebacks. |
